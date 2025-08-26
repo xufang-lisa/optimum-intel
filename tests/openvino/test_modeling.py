@@ -1027,6 +1027,9 @@ class OVModelForFeatureExtractionIntegrationTest(unittest.TestCase):
         "sentence-transformers-bert",
     )
 
+    if is_transformers_version(">=", "4.51.0"):
+        SUPPORTED_ARCHITECTURES += ("qwen3",)
+
     @parameterized.expand(SUPPORTED_ARCHITECTURES)
     def test_compare_to_transformers(self, model_arch):
         model_id = MODEL_NAMES[model_arch]
@@ -1183,6 +1186,12 @@ class OVModelForCausalLMIntegrationTest(unittest.TestCase):
     if is_transformers_version(">=", "4.51.3"):
         SUPPORTED_ARCHITECTURES += ("glm4",)
 
+    if is_transformers_version(">=", "4.53.0"):
+        SUPPORTED_ARCHITECTURES += ("arcee",)
+
+    if is_transformers_version(">=", "4.54.0"):
+        SUPPORTED_ARCHITECTURES += ("ernie4_5",)
+
     GENERATION_LENGTH = 100
     REMOTE_CODE_MODELS = (
         "chatglm",
@@ -1270,8 +1279,11 @@ class OVModelForCausalLMIntegrationTest(unittest.TestCase):
         "qwen3_moe": 2,
         "mamba": 0,
         "falcon-mamba": 0,
+        "arcee": 2,
+        "ernie4_5": 2,
     }
 
+    # TODO: remove gptq/awq from here
     @parameterized.expand(SUPPORTED_ARCHITECTURES)
     def test_compare_to_transformers(self, model_arch):
         model_id = MODEL_NAMES[model_arch]
@@ -1332,7 +1344,6 @@ class OVModelForCausalLMIntegrationTest(unittest.TestCase):
         )
 
         if "awq" in model_arch or "gptq" in model_arch:
-            # infer in FP32
             model_kwargs["torch_dtype"] = torch.float32
 
         set_seed(SEED)
@@ -1370,12 +1381,9 @@ class OVModelForCausalLMIntegrationTest(unittest.TestCase):
         gen_config = GenerationConfig(
             max_new_tokens=30,
             min_new_tokens=30,
-            num_beams=2 if model_arch != "chatglm4" else 1,
+            num_beams=1 if model_arch == "chatglm4" else 2,
             do_sample=False,
-            eos_token_id=None,
         )
-        if is_transformers_version(">=", "4.51"):
-            tokens["use_model_defaults"] = False
 
         ov_outputs = ov_model.generate(**tokens, generation_config=gen_config)
 
@@ -1397,11 +1405,10 @@ class OVModelForCausalLMIntegrationTest(unittest.TestCase):
             transformers_outputs = transformers_model.generate(
                 **tokens, generation_config=gen_config, **additional_inputs
             )
-        print(f"ov_outputs: {ov_outputs}")
-        print(f"transformers_outputs: {transformers_outputs}")
+
         self.assertTrue(
             torch.allclose(ov_outputs, transformers_outputs),
-            "OV output {ov_outputs}\nTransformers output  {transformers_output}",
+            f"OV output {ov_outputs}\nTransformers output  {transformers_outputs}",
         )
 
         del transformers_model
@@ -1429,7 +1436,8 @@ class OVModelForCausalLMIntegrationTest(unittest.TestCase):
         if is_transformers_version(">=", "4.51"):
             additional_args["use_model_defaults"] = False
 
-        model = OVModelForCausalLM.from_pretrained(model_id, use_cache=False, compile=False, **model_kwargs)
+        set_seed(SEED)
+        model = OVModelForCausalLM.from_pretrained(model_id, use_cache=True, compile=False, **model_kwargs)
         model.eval()
         model.config.encoder_no_repeat_ngram_size = 0
         model.to("cpu")
@@ -1438,7 +1446,7 @@ class OVModelForCausalLMIntegrationTest(unittest.TestCase):
         pipe = pipeline("text-generation", model=model, tokenizer=tokenizer)
         inputs = "My name is Arthur and I live in"
         set_seed(SEED)
-        outputs = pipe(inputs, max_new_tokens=5, **additional_args, do_sample=False)
+        outputs = pipe(inputs, min_new_tokens=5, max_new_tokens=5, **additional_args, do_sample=False)
         self.assertEqual(pipe.device, model.device)
         self.assertTrue(all(inputs in item["generated_text"] for item in outputs))
         ov_pipe = optimum_pipeline(
@@ -1449,7 +1457,7 @@ class OVModelForCausalLMIntegrationTest(unittest.TestCase):
             tokenizer=tokenizer if model_arch == "qwen" else None,
         )
         set_seed(SEED)
-        ov_outputs = ov_pipe(inputs, max_new_tokens=5, **additional_args, do_sample=False)
+        ov_outputs = ov_pipe(inputs, min_new_tokens=5, max_new_tokens=5, **additional_args, do_sample=False)
         self.assertEqual(outputs[-1]["generated_text"], ov_outputs[-1]["generated_text"])
         del ov_pipe
         del pipe
@@ -1717,6 +1725,7 @@ class OVModelForCausalLMIntegrationTest(unittest.TestCase):
                 torch.equal(ov_stateful_outputs, transformers_outputs),
                 f"generation config : {gen_config}, transformers output {transformers_outputs}, ov_model_stateful output {ov_stateful_outputs}",
             )
+
             set_seed(SEED)
             ov_stateless_outputs = ov_model_stateless.generate(**tokens, generation_config=gen_config)
             self.assertTrue(
@@ -1946,13 +1955,17 @@ class OVModelForSeq2SeqLMIntegrationTest(unittest.TestCase):
     SUPPORT_STATEFUL = ("t5", "mt5")
     if is_transformers_version(">=", "4.52.0"):
         SUPPORT_STATEFUL += ("bart", "blenderbot", "blenderbot-small", "m2m_100", "marian", "mbart")
-        # all models are stateful on transformers main, but pegasus update is not included in 4.52 yet
+    if is_transformers_version(">=", "4.53.0"):
+        SUPPORT_STATEFUL += ("pegasus",)
 
     @parameterized.expand(SUPPORTED_ARCHITECTURES)
     def test_compare_to_transformers(self, model_arch):
         model_id = MODEL_NAMES[model_arch]
         set_seed(SEED)
         ov_model = OVModelForSeq2SeqLM.from_pretrained(model_id, export=True, ov_config=F32_CONFIG)
+        ov_stateless_model = OVModelForSeq2SeqLM.from_pretrained(
+            model_id, export=True, use_cache=False, stateful=False, ov_config=F32_CONFIG
+        )
         expected_stateful = is_transformers_version(">", "4.43") and model_arch in self.SUPPORT_STATEFUL
         self.assertEqual(ov_model.decoder.stateful, expected_stateful)
         self.assertEqual(model_has_state(ov_model.decoder.model), expected_stateful)
@@ -1970,6 +1983,7 @@ class OVModelForSeq2SeqLMIntegrationTest(unittest.TestCase):
         decoder_start_token_id = transformers_model.config.decoder_start_token_id if model_arch != "mbart" else 2
         decoder_inputs = {"decoder_input_ids": torch.ones((1, 1), dtype=torch.long) * decoder_start_token_id}
         ov_outputs = ov_model(**tokens, **decoder_inputs)
+        ov_stateless_outputs = ov_stateless_model(**tokens, **decoder_inputs)
 
         self.assertTrue("logits" in ov_outputs)
         self.assertIsInstance(ov_outputs.logits, torch.Tensor)
@@ -1978,6 +1992,7 @@ class OVModelForSeq2SeqLMIntegrationTest(unittest.TestCase):
             transformers_outputs = transformers_model(**tokens, **decoder_inputs)
         # Compare tensor outputs
         self.assertTrue(torch.allclose(ov_outputs.logits, transformers_outputs.logits, atol=5e-3))
+        self.assertTrue(torch.allclose(ov_stateless_outputs.logits, transformers_outputs.logits, atol=5e-3))
         gen_config = GenerationConfig(
             max_new_tokens=10,
             min_new_tokens=10,
@@ -1990,8 +2005,11 @@ class OVModelForSeq2SeqLMIntegrationTest(unittest.TestCase):
         generated_tokens = transformers_model.generate(**tokens, generation_config=gen_config)
         set_seed(SEED)
         ov_generated_tokens = ov_model.generate(**tokens, generation_config=gen_config)
+        set_seed(SEED)
+        ov_stateless_generated_tokens = ov_stateless_model.generate(**tokens, generation_config=gen_config)
 
         self.assertTrue(torch.equal(generated_tokens, ov_generated_tokens))
+        self.assertTrue(torch.equal(generated_tokens, ov_stateless_generated_tokens))
 
         del transformers_model
         del ov_model
@@ -2425,7 +2443,7 @@ class OVModelForVisualCausalLMIntegrationTest(unittest.TestCase):
     SUPPORT_AUDIO = []
 
     if is_transformers_version(">=", "4.40.0"):
-        SUPPORTED_ARCHITECTURES += ["llava_next", "nanollava"]
+        SUPPORTED_ARCHITECTURES += ["llava_next", "llava_next_mistral", "nanollava"]
 
     if is_transformers_version(">=", "4.42.0"):
         SUPPORTED_ARCHITECTURES += ["llava_next_video"]
@@ -2460,6 +2478,7 @@ class OVModelForVisualCausalLMIntegrationTest(unittest.TestCase):
         if is_transformers_version(">=", "4.46") and model_arch in [
             "llava",
             "llava_next",
+            "llava_next_mistral",
             "qwen2_vl",
             "qwen2_5_vl",
             "got_ocr2",
@@ -2479,7 +2498,7 @@ class OVModelForVisualCausalLMIntegrationTest(unittest.TestCase):
             from transformers import LlavaForConditionalGeneration
 
             return LlavaForConditionalGeneration
-        if model_arch == "llava_next":
+        if model_arch.startswith("llava_next"):
             from transformers import LlavaNextForConditionalGeneration
 
             return LlavaNextForConditionalGeneration
@@ -2660,7 +2679,7 @@ class OVModelForVisualCausalLMIntegrationTest(unittest.TestCase):
 
         gc.collect()
 
-    @parameterized.expand(["llava", "llava_next", "llava_next_video"])
+    @parameterized.expand(["llava", "llava_next", "llava_next_video", "llava_next_mistral"])
     @unittest.skipIf(
         is_transformers_version("<", "4.45.0"), reason="New preprocessing available only in transformers >= 4.45"
     )
@@ -2842,6 +2861,9 @@ class OVModelForSpeechSeq2SeqIntegrationTest(unittest.TestCase):
         model_id = MODEL_NAMES[model_arch]
         transformers_model = AutoModelForSpeechSeq2Seq.from_pretrained(model_id)
         ov_model = OVModelForSpeechSeq2Seq.from_pretrained(model_id, export=True, ov_config=F32_CONFIG)
+        ov_model_stateless = OVModelForSpeechSeq2Seq.from_pretrained(
+            model_id, export=True, ov_config=F32_CONFIG, stateful=False
+        )
         self.assertIsInstance(ov_model.config, PretrainedConfig)
         # whisper cache class support implemented in 4.43
         expected_stateful = is_transformers_version(">", "4.43")
@@ -2866,9 +2888,13 @@ class OVModelForSpeechSeq2SeqIntegrationTest(unittest.TestCase):
                 decoder_inputs = {"decoder_input_ids": np.ones((1, 1), dtype=np.int64) * decoder_start_token_id}
 
             ov_outputs = ov_model(**features, **decoder_inputs)
+            ov_stateless_outputs = ov_model_stateless(**features, **decoder_inputs)
             self.assertIn("logits", ov_outputs)
             # Compare tensor outputs
             self.assertTrue(torch.allclose(torch.Tensor(ov_outputs.logits), transformers_outputs.logits, atol=1e-3))
+            self.assertTrue(
+                torch.allclose(torch.Tensor(ov_stateless_outputs.logits), transformers_outputs.logits, atol=1e-3)
+            )
 
         generate_kwrgs = {}
         if is_transformers_version(">=", "4.50"):
@@ -2886,8 +2912,13 @@ class OVModelForSpeechSeq2SeqIntegrationTest(unittest.TestCase):
         generated_tokens = transformers_model.generate(**pt_features, generation_config=gen_config, **generate_kwrgs)
         set_seed(SEED)
         ov_generated_tokens = ov_model.generate(**pt_features, generation_config=gen_config, **generate_kwrgs)
+        set_seed(SEED)
+        ov_stateless_generated_tokens = ov_model_stateless.generate(
+            **pt_features, generation_config=gen_config, **generate_kwrgs
+        )
 
         self.assertTrue(torch.equal(generated_tokens, ov_generated_tokens))
+        self.assertTrue(torch.equal(generated_tokens, ov_stateless_generated_tokens))
 
         del transformers_model
         del ov_model
