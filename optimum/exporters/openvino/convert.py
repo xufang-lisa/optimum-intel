@@ -424,6 +424,10 @@ def export_pytorch(
                 __make_16bit_traceable(model)
             check_dummy_inputs_are_allowed(model, dummy_inputs)
             input_info = _get_input_info(model, config, dummy_inputs)
+            if getattr(model_config, "is_eagle3", False) and getattr(model_config, "target_model_type", "") == "qwen2_5_vl":
+                input_info.pop(0)
+                dummy_inputs.pop("input_ids")
+                dummy_input_keys = list(dummy_inputs.keys())
             ts_decoder = TorchScriptPythonDecoder(model, example_input=dummy_inputs, **ts_decoder_kwargs)
             ov_model = convert_model(
                 ts_decoder,

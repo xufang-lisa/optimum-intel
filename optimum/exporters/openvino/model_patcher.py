@@ -6734,7 +6734,7 @@ class LlamaEagle3Attention(nn.Module):
                                                        max_position_embeddings=self.max_position_embeddings)
         else:
             scaling_type = self.config.rope_scaling.get("rope_type", self.config.rope_scaling.get("type")) 
-            scaling_factor = self.config.rope_scaling["factor"]
+            scaling_factor = self.config.rope_scaling.get("factor", None)
             if scaling_type == "linear":
                 self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
                     self.head_dim, max_position_embeddings=self.max_position_embeddings, scaling_factor=scaling_factor
@@ -7009,6 +7009,9 @@ class LlamaEagle3Model(LlamaEagle3PreTrainedModel):
         self.register_buffer("t2d", t2d)
         self.lm_head = nn.Linear(config.hidden_size, config.draft_vocab_size, bias=False)
         self.identity = torch.nn.Identity()
+        self.is_vl = False
+        if hasattr(config, "target_model_type") and config.target_model_type == "qwen2_5_vl":
+            self.is_vl = True
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -7053,7 +7056,12 @@ class LlamaEagle3Model(LlamaEagle3PreTrainedModel):
             )
             position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
         else:
-            position_ids = position_ids.view(-1, seq_length).long()
+            if self.is_vl:
+                if position_ids.ndim == 2:
+                    position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
+                    # position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
+            else:
+                position_ids = position_ids.view(-1, seq_length).long()
 
         #position_ids=position_ids//4
         if attention_mask is None:

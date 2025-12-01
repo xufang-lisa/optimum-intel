@@ -550,7 +550,7 @@ class EAGLE3DummyGenerator(DummyInputGenerator):
     Generates dummy hidden_states inputs.
     """
 
-    SUPPORTED_INPUT_NAMES = ("hidden_states",)
+    SUPPORTED_INPUT_NAMES = ("hidden_states", "inputs_embeds")
 
     def __init__(
         self,
@@ -565,11 +565,18 @@ class EAGLE3DummyGenerator(DummyInputGenerator):
         self.hidden_size = normalized_config.hidden_size
 
     def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
-        shape = (
-            self.batch_size,
-            self.sequence_length,
-            self.hidden_size*3,
-        )
+        if input_name == "hidden_states":
+            shape = (
+                self.batch_size,
+                self.sequence_length,
+                self.hidden_size*3,
+            )
+        else:
+            shape = (
+                self.batch_size,
+                self.sequence_length,
+                self.hidden_size,
+            )
         return self.random_float_tensor(shape, framework=framework, dtype=float_dtype)
 @register_in_tasks_manager(
     "llama",
@@ -586,10 +593,37 @@ class LlamaOpenVINOConfig(LlamaOnnxConfig):
     DUMMY_INPUT_GENERATOR_CLASSES = LlamaOnnxConfig.DUMMY_INPUT_GENERATOR_CLASSES + (EAGLE3DummyGenerator,)
     _MODEL_PATCHER = OVDecoderModelPatcher
 
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        task: str = "feature-extraction",
+        int_dtype: str = "int64",
+        float_dtype: str = "fp32",
+        use_past: bool = False,
+        use_past_in_inputs: bool = False,
+        preprocessors: list[Any] | None = None,
+    ):
+        task = "text-generation"
+        super().__init__(
+            config=config,
+            task=task,
+            int_dtype=int_dtype,
+            float_dtype=float_dtype,
+            use_past=use_past,
+            use_past_in_inputs=use_past_in_inputs,
+            preprocessors=preprocessors,
+        )
+        self.is_vl = False
+        if hasattr(config, "target_model_type") and config.target_model_type == "qwen2_5_vl":
+            self.is_vl = True
+
     @property
     def inputs(self) -> Dict[str, Dict[int, str]]:
         common_inputs = super().inputs
         common_inputs["hidden_states"] = {0: "batch_size", 1: "sequence_length", 2: "hidden_size"}
+        if self.is_vl:
+            common_inputs["inputs_embeds"] = {0: "batch_size", 1: "sequence_length", 2: "hidden_size"}
+
         return common_inputs
 
     @property
@@ -598,6 +632,12 @@ class LlamaOpenVINOConfig(LlamaOnnxConfig):
         # Add d2t buffer as eagle3 draft output
         common_outputs['d2t'] = {0: "vocab_size"}
         return common_outputs
+
+    def generate_dummy_inputs(self, framework: str = "pt", **kwargs):
+        dummy_inputs = super().generate_dummy_inputs(framework=framework, **kwargs)
+        if self.is_vl:
+            dummy_inputs["position_ids"] = dummy_inputs["position_ids"].unsqueeze(0).expand(3, -1, -1)
+        return dummy_inputs
 
 @register_in_tasks_manager(
     "gpt_oss",
