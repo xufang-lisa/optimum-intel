@@ -113,6 +113,31 @@ def infer_task(
                 )
     return task
 
+def convert_speculator_config_and_weight(model_path, org_config):
+    new_config = {}
+    # extract llama config from transformer_layer_config
+    if 'transformer_layer_config' not in org_config.keys():
+        raise ValueError(f'transformer_layer_config not in speculator config.')
+
+    new_config = org_config['transformer_layer_config']
+    if 'draft_vocab_size' in org_config.keys():
+        new_config['draft_vocab_size'] = org_config['draft_vocab_size']
+
+    # modify layers.0.xxx.weight to midlayer.xxx.weight
+    weight_file = os.path.join(model_path, "model.safetensors")
+    weight_file_bak = os.path.join(model_path, 'bak_model.safetensors')
+    shutil.copy2(weight_file, weight_file_bak)
+    weights = load_file(weight_file)
+    new_weights = {}
+    for key, value in weights.items():
+        new_key = key
+        if 'layers.0' in key:
+            new_key = key.replace('layers.0', 'midlayer')
+        new_weights[new_key] = value
+    save_file(new_weights, weight_file)
+
+    return new_config
+
 def eagle3_config(model_path: str):
     config_file = os.path.join(model_path, 'config.json')
     # rename the origin config
@@ -123,6 +148,11 @@ def eagle3_config(model_path: str):
     with open(new_config_file, 'r', encoding='utf-8') as f:
         config = json.load(f)
     # modify config
+    # convert speculator config to transformer config
+    if 'architectures' in config.keys():
+        if 'Eagle3Speculator' in config['architectures']:
+            config = convert_speculator_config_and_weight(model_path, config)
+
     if 'model_type' in config.keys():
         org_type = config['model_type']
         if org_type != 'llama':
@@ -151,6 +181,13 @@ def remove_config(model_path: str, ov_path: str, download_to_local: bool):
         new_config_file = os.path.join(model_path, 'config_temp.json')
         if os.path.exists(new_config_file):
             os.remove(new_config_file)
+
+        # restore backup weight file
+        weight_file_bak = os.path.join(model_path, 'bak_model.safetensors')
+        weight_file = os.path.join(model_path, 'model.safetensors')
+        if os.path.exists(weight_file_bak) and os.path.exists(weight_file):
+            os.replace(weight_file_bak, weight_file)
+
 
 def download_eagle3_model(model_path: str):
     dir_name = tempfile.mkdtemp()
@@ -328,8 +365,7 @@ def main_export(
         loading_kwargs['_configuration_file'] = eagle3_config(model_name_or_path)
 
     if library_name == "transformers":
-        config = AutoConfig.from_pretrained(
-            model_name_or_path,
+        base_kwargs = dict(
             subfolder=subfolder,
             revision=revision,
             cache_dir=cache_dir,
@@ -338,6 +374,11 @@ def main_export(
             force_download=force_download,
             trust_remote_code=trust_remote_code,
         )
+        if '_configuration_file' in loading_kwargs.keys():
+            base_kwargs['loading_kwargs'] = loading_kwargs['_configuration_file']
+
+        config = AutoConfig.from_pretrained(model_name_or_path, **base_kwargs)
+
         quantization_config = getattr(config, "quantization_config", None)
         quant_method = quantization_config.get("quant_method", None) if quantization_config else None
 
