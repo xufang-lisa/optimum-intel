@@ -134,6 +134,7 @@ def convert_speculator_config_and_weight(model_path, org_config):
         if 'layers.0' in key:
             new_key = key.replace('layers.0', 'midlayer')
         new_weights[new_key] = value
+    os.remove(weight_file)
     save_file(new_weights, weight_file)
 
     return new_config
