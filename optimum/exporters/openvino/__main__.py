@@ -375,7 +375,7 @@ def main_export(
             trust_remote_code=trust_remote_code,
         )
         if '_configuration_file' in loading_kwargs.keys():
-            base_kwargs['loading_kwargs'] = loading_kwargs['_configuration_file']
+            base_kwargs['_configuration_file'] = loading_kwargs['_configuration_file']
 
         config = AutoConfig.from_pretrained(model_name_or_path, **base_kwargs)
 
