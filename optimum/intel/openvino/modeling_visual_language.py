@@ -4802,6 +4802,53 @@ class _OVLlama4ForCausalLM(OVModelForVisualCausalLM):
         return inputs
 
 
+class _OVVideoChatFlashQwenForCausalLM(OVModelForVisualCausalLM):
+    additional_parts = ["vision_projection"]
+
+    @staticmethod
+    def preprocess_inputs(
+        text: str,
+        image: Optional["Image"] = None,
+        processor: Optional[AutoImageProcessor] = None,
+        tokenizer: Optional[PreTrainedTokenizer] = None,
+        config: Optional[PretrainedConfig] = None,
+        video: Optional["VideoInput"] = None,
+        audio: Optional[np.ndarray] = None,
+    ):
+        # Note: The implementation of this function is not validated, it's only there to allow this subclass to be initialized.
+        if processor is None:
+            raise ValueError("Processor is required.")
+        if audio is not None:
+            raise ValueError("Audio input is not supported")
+        if getattr(processor, "chat_template", None) is not None:
+            chat_prompt = [{"role": "user", "content": [{"type": "text", "text": text}]}]
+            if image is not None:
+                chat_prompt[0]["content"].append({"type": "image"})
+            if video is not None:
+                chat_prompt[0]["content"].append({"type": "video"})
+            prompt = processor.apply_chat_template(chat_prompt, add_generation_prompt=True, tokenize=False)
+        else:
+            prompt = text
+            if image is not None and "<image>" not in prompt:
+                prompt = "<image>\n" + prompt
+            if video is not None and "<video>" not in prompt:
+                prompt = "<video>\n" + prompt
+
+        if is_transformers_version(">", "4.47.99") and getattr(processor, "patch_size", None) is None:
+            if (
+                getattr(config, "vision_config", None) is not None
+                and getattr(config.vision_config, "patch_size", None) is not None
+            ):
+                processor.patch_size = config.vision_config.patch_size
+            else:
+                raise ValueError(
+                    "Processor does not have `patch_size` attribute. Please fix the processor or provide `patch_size` in the config."
+                )
+
+        inputs = processor(images=image, text=prompt, videos=video, return_tensors="pt")
+        return inputs
+
+
 MODEL_TYPE_TO_CLS_MAPPING = {
     "llava": _OVLlavaForCausalLM,
     "llava_next": _OVLlavaNextForCausalLM,
@@ -4824,4 +4871,5 @@ MODEL_TYPE_TO_CLS_MAPPING = {
     "llama4": _OVLlama4ForCausalLM,
     "qwen3_vl": _OVQwen3VLForCausalLM,
     "minicpmo": _OVMiniCPMOForCausalLM,
+    "videochat_flash_qwen": _OVVideoChatFlashQwenForCausalLM,
 }
