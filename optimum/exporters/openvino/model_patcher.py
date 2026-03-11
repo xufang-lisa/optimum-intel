@@ -7640,6 +7640,22 @@ class AfmoeModelPatcher(OVDecoderModelPatcher):
                 del afmoe_moe.down_projs, afmoe_moe.gate_projs, afmoe_moe.up_projs
 
 
+# fork from https://github.com/sgl-project/SpecForge/blob/main/specforge/modeling/draft/llama3_eagle.py
+def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section, unsqueeze_dim=1):
+    from transformers.models.llama.modeling_llama import rotate_half
+    mrope_section = mrope_section * 2
+    cos = torch.cat(
+        [m[i % 3] for i, m in enumerate(cos.split(mrope_section, dim=-1))], dim=-1
+    ).unsqueeze(unsqueeze_dim)
+    sin = torch.cat(
+        [m[i % 3] for i, m in enumerate(sin.split(mrope_section, dim=-1))], dim=-1
+    ).unsqueeze(unsqueeze_dim)
+
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
 # adopted from https://github.com/huggingface/transformers/blob/v4.57.6/src/transformers/models/llama/modeling_llama.py#L197
 class LlamaEagle3Attention(LlamaAttention):
     """
@@ -7653,9 +7669,61 @@ class LlamaEagle3Attention(LlamaAttention):
 
     def __init__(self, config):
         super().__init__(config, 0)
+        self.is_vl = False
+        if hasattr(config, "target_model_type") and "vl" in config.target_model_type:
+            self.is_vl = True
         self.q_proj = nn.Linear(config.hidden_size * 2, config.num_attention_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(config.hidden_size * 2, config.num_key_value_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(config.hidden_size * 2, config.num_key_value_heads * self.head_dim, bias=False)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        attention_mask: torch.Tensor | None = None,
+        past_key_values: Cache | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+        from transformers.models.llama.modeling_llama import eager_attention_forward
+        if not self.is_vl:
+            return super().forward(
+                hidden_states=hidden_states,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                **kwargs,
+            )
+        else:
+            input_shape = hidden_states.shape[:-1]
+            hidden_shape = (*input_shape, -1, self.head_dim)
+
+            query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+            key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+            value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+            cos, sin = position_embeddings
+            query_states, key_states = apply_multimodal_rotary_pos_emb(query_states, key_states, cos, sin, self.config.rope_scaling["mrope_section"])
+
+            if past_key_values is not None:
+                key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+
+            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+
+            attn_output, attn_weights = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                **kwargs,
+            )
+
+            attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+            attn_output = self.o_proj(attn_output)
+            return attn_output, attn_weights
 
 
 # adopted from https://github.com/huggingface/transformers/blob/v4.57.6/src/transformers/models/llama/modeling_llama.py#L268
@@ -7720,7 +7788,23 @@ class LlamaEagle3DecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
 
         return hidden_states
+# fork from https://github.com/sgl-project/SpecForge/blob/main/specforge/modeling/draft/llama3_eagle.py
+class LlamaEagle3VLRotaryEmbedding(LlamaRotaryEmbedding):
+    @torch.no_grad()
+    def forward(self, x, position_ids):
+        # In contrast to other models, Qwen2_5_VL has different position ids for the grids
+        # So we expand the inv_freq to shape (3, ...)
+        inv_freq_expanded = (self.inv_freq[None, None, :, None].float().expand(3, position_ids.shape[1], -1, 1))
+        position_ids_expanded = position_ids[:, :, None, :].float()  # shape (3, bs, 1, positions)
 
+        device_type = (x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu")
+        with torch.autocast(device_type=device_type, enabled=False):  # Force float32
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(2, 3)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos() * self.attention_scaling
+            sin = emb.sin() * self.attention_scaling
+
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 # adopted from https://github.com/huggingface/transformers/blob/v4.57.6/src/transformers/models/llama/modeling_llama.py#L334
 class LlamaEagle3Model(LlamaPreTrainedModel):
@@ -7740,10 +7824,17 @@ class LlamaEagle3Model(LlamaPreTrainedModel):
     def __init__(self, config: LlamaConfig):
         config.tie_word_embeddings = False
         super().__init__(config)
+        self.is_vl = False
+        if hasattr(config, "target_model_type") and "vl" in config.target_model_type:
+            self.is_vl = True
+
         self.hidden_size = config.hidden_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
-        self.rotary_emb = LlamaRotaryEmbedding(config=config)
+        if self.is_vl:
+            self.rotary_emb = LlamaEagle3VLRotaryEmbedding(config=config)
+        else:
+            self.rotary_emb = LlamaRotaryEmbedding(config=config)
 
         self.midlayer = LlamaEagle3DecoderLayer(config)
         self.target_hidden_size = getattr(config, "target_hidden_size", config.hidden_size)

@@ -759,6 +759,29 @@ class Eagle3DummyGenerator(DummyInputGenerator):
         return self.random_float_tensor(shape, framework=framework, dtype=float_dtype)
 
 
+class Eagle3VLDummyGenerator(Eagle3DummyGenerator):
+    """
+    Dummy input generator for Eagle-3 VL speculative decoding.
+
+    This generator produces synthetic `hidden_states` tensors that mimic the
+    intermediate hidden-state outputs of a *main (target) model*, which are
+    required by the Eagle-3 draft model during speculative decoding.
+    """
+
+    SUPPORTED_INPUT_NAMES = ("hidden_states", "inputs_embeds")
+
+    def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
+        if input_name == "inputs_embeds":
+            shape = (
+                self.batch_size,
+                self.sequence_length,
+                self.hidden_size,
+            )
+            return self.random_float_tensor(shape, framework=framework, dtype=float_dtype)
+        else:
+            return super().generate(input_name, framework=framework, int_dtype=int_dtype, float_dtype=float_dtype)
+
+
 @register_in_tasks_manager(
     "llama",
     *[
@@ -794,8 +817,13 @@ class LlamaOpenVINOConfig(LlamaOnnxConfig):
         )
         archs = getattr(config, "architectures", None)
         self.eagle3 = False
+        self.is_vl = False
         if isinstance(archs, list) and len(archs) > 0 and "eagle3" in archs[0].lower():
-            self.DUMMY_INPUT_GENERATOR_CLASSES += (Eagle3DummyGenerator,)
+            if hasattr(config, "target_model_type") and "vl" in config.target_model_type.lower():
+                self.is_vl = True
+                self.DUMMY_INPUT_GENERATOR_CLASSES += (Eagle3VLDummyGenerator,)
+            else:
+                self.DUMMY_INPUT_GENERATOR_CLASSES += (Eagle3DummyGenerator,)
             self.MIN_TRANSFORMERS_VERSION = "4.54.0"
             self.eagle3 = True
 
@@ -805,6 +833,8 @@ class LlamaOpenVINOConfig(LlamaOnnxConfig):
         # Eagle3 model has additional conditional input
         if self.eagle3:
             common_inputs["hidden_states"] = {0: "batch_size", 1: "sequence_length", 2: "hidden_size"}
+        if self.is_vl:
+            common_inputs["inputs_embeds"] = {0: "batch_size", 1: "sequence_length", 2: "hidden_size"}
         return common_inputs
 
     @property
@@ -814,6 +844,12 @@ class LlamaOpenVINOConfig(LlamaOnnxConfig):
         if self.eagle3:
             common_outputs["d2t"] = {0: "vocab_size"}
         return common_outputs
+
+    def generate_dummy_inputs(self, framework: str = "pt", **kwargs):
+        dummy_inputs = super().generate_dummy_inputs(framework=framework, **kwargs)
+        if self.is_vl:
+            dummy_inputs["position_ids"] = dummy_inputs["position_ids"].unsqueeze(0).expand(3, -1, -1)
+        return dummy_inputs
 
 
 @register_in_tasks_manager(

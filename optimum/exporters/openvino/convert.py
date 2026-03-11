@@ -417,6 +417,10 @@ def export_pytorch(
         with patcher:
             check_dummy_inputs_are_allowed(model, dummy_inputs)
             input_info = _get_input_info(model, config, dummy_inputs)
+            if getattr(config, "eagle3", False) and getattr(config, "is_vl", False):
+                input_info.pop(0)
+                dummy_inputs.pop("input_ids")
+                dummy_input_keys = list(dummy_inputs.keys())
             torch_export = os.getenv("OPENVINO_DYNAMO_EXPORT", "false").lower() == "true"
             if torch_export:
                 if hasattr(torch.ops, "_prepare_4d_causal_attention_mask_for_sdpa"):
