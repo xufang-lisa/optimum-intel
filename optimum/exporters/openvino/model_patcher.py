@@ -7790,6 +7790,12 @@ class LlamaEagle3DecoderLayer(nn.Module):
         return hidden_states
 # fork from https://github.com/sgl-project/SpecForge/blob/main/specforge/modeling/draft/llama3_eagle.py
 class LlamaEagle3VLRotaryEmbedding(LlamaRotaryEmbedding):
+    def __init__(self, config):
+        # mrope in the config of qwen2.5 VL model
+        if hasattr(config, "rope_scaling") and "rope_type" in config.rope_scaling:
+            config.rope_scaling["rope_type"] = "default"
+        super().__init__(config)
+
     @torch.no_grad()
     def forward(self, x, position_ids):
         # In contrast to other models, Qwen2_5_VL has different position ids for the grids
