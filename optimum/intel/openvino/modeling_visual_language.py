@@ -5063,6 +5063,8 @@ class _OVVideoChatFlashQwenForCausalLM(OVModelForVisualCausalLM):
         return x
 
     def get_vision_projection(self, x, compress=False, local_num_frames=-1):
+        if compress:
+            x = x.reshape(x.shape[0] // local_num_frames, -1, x.shape[-1])
         x = self.vision_projection(x)
         x = torch.from_numpy(x) if isinstance(x, np.ndarray) else x
         return x

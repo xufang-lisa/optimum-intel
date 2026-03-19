@@ -5370,6 +5370,7 @@ class DummyVideoChatFlashQwenProjectorInputGenerator(DummyInputGenerator):
         self.normalized_config = normalized_config
         self.grid_w = 224 // 14
         self.grid_h = 224 // 14
+        self.num_frames = normalized_config.mm_local_num_frames
 
     def generate(
         self,
@@ -5378,7 +5379,7 @@ class DummyVideoChatFlashQwenProjectorInputGenerator(DummyInputGenerator):
         int_dtype: str = "int64",
         float_dtype: str = "fp32",
     ):
-        shape = [self.visual_seq_length, self.grid_h * self.grid_w, self.hidden_size]
+        shape = [self.visual_seq_length, self.grid_h * self.grid_w * self.num_frames, self.hidden_size]
         return self.random_float_tensor(shape, framework=framework, dtype=float_dtype)
 
 
