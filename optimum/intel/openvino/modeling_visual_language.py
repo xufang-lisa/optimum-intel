@@ -5063,23 +5063,6 @@ class _OVVideoChatFlashQwenForCausalLM(OVModelForVisualCausalLM):
         return x
 
     def get_vision_projection(self, x, compress=False, local_num_frames=-1):
-        height = width = self.image_size // self.patch_size
-        assert height * width == x.shape[1]
-
-        if local_num_frames != -1 and local_num_frames != 1:
-            assert compress is True
-        if compress:
-            if local_num_frames != -1:
-                num_frames = local_num_frames
-                x = x.reshape(x.shape[0] // local_num_frames, -1, x.shape[-1])
-            else:
-                num_frames = x.shape[0]
-                x = x.reshape(1, -1, x.shape[-1])
-            num_tome_tokens = 16 * num_frames
-        else:
-            num_tome_tokens = 64
-
-        x = self.merge_tokens(x, target_num_token=num_tome_tokens)
         x = self.vision_projection(x)
         x = torch.from_numpy(x) if isinstance(x, np.ndarray) else x
         return x

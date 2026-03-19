@@ -354,7 +354,8 @@ def export_pytorch(
     config.stateful = stateful
 
     with torch.no_grad():
-        if hasattr(model, "config"):
+        from transformers import PretrainedConfig
+        if hasattr(model, "config") and isinstance(model.config, PretrainedConfig):
             model.config.torchscript = False
             model.config.return_dict = True
         model.eval()
@@ -364,7 +365,7 @@ def export_pytorch(
             logger.info(f"Overriding {len(config.values_override)} configuration item(s)")
             for override_config_key, override_config_value in config.values_override.items():
                 logger.info(f"\t- {override_config_key} -> {override_config_value}")
-                if hasattr(model, "config"):
+                if hasattr(model, "config") and isinstance(model.config, PretrainedConfig):
                     setattr(model.config, override_config_key, override_config_value)
 
         if input_shapes is None:

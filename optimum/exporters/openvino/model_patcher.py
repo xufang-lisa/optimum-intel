@@ -7725,7 +7725,12 @@ class VideochatFlashQwenVisionProjectionModelPatcher(ModelPatcher):
         model.__orig_forward = model.forward
 
         def forward_wrap(self, hidden_states):
-            return self.__orig_forward(input=hidden_states)
+            local_num_frames = getattr(self._config, "mm_local_num_frames", -1)
+            x = hidden_states.reshape(hidden_states.shape[0] // local_num_frames, -1, hidden_states.shape[-1])
+            target_num_token = 16 * local_num_frames
+            x = self.merge_tokens(x, target_num_token=target_num_token)
+            x = self.mlp(x)
+            return x
 
         model.forward = types.MethodType(forward_wrap, model)
         super().__init__(config, model, model_kwargs)

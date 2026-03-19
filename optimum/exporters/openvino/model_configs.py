@@ -5358,6 +5358,7 @@ class DummyVideoChatFlashQwenProjectorInputGenerator(DummyInputGenerator):
         task: str,
         normalized_config: NormalizedTextConfig,
         batch_size: int = DEFAULT_DUMMY_SHAPES["batch_size"],
+        visual_seq_length: int = DEFAULT_DUMMY_SHAPES["visual_seq_length"],
         random_batch_size_range: Optional[Tuple[int, int]] = None,
         **kwargs,
     ):
@@ -5365,7 +5366,10 @@ class DummyVideoChatFlashQwenProjectorInputGenerator(DummyInputGenerator):
         self.batch_size = batch_size
         self.hidden_size = normalized_config.mm_hidden_size
         self.num_patches = 64
+        self.visual_seq_length = visual_seq_length
         self.normalized_config = normalized_config
+        self.grid_w = 224 // 14
+        self.grid_h = 224 // 14
 
     def generate(
         self,
@@ -5374,7 +5378,7 @@ class DummyVideoChatFlashQwenProjectorInputGenerator(DummyInputGenerator):
         int_dtype: str = "int64",
         float_dtype: str = "fp32",
     ):
-        shape = [self.batch_size, self.num_patches, self.hidden_size]
+        shape = [self.visual_seq_length, self.grid_h * self.grid_w, self.hidden_size]
         return self.random_float_tensor(shape, framework=framework, dtype=float_dtype)
 
 
@@ -5480,7 +5484,7 @@ class VideoChatFlashQwenOpenVINOConfig(BaseVLMOpenVINOConfig):
             behavior = VideoChatFlashQwenConfigBehavior(behavior)
 
         if behavior == VideoChatFlashQwenConfigBehavior.VISION_PROJECTION:
-            return model.get_model().mm_projector.mlp
+            return model.get_model().mm_projector
 
         if behavior == VideoChatFlashQwenConfigBehavior.VISION_EMBEDDINGS:
             return model.get_vision_tower().vision_tower
