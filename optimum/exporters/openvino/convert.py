@@ -355,6 +355,7 @@ def export_pytorch(
 
     with torch.no_grad():
         from transformers import PretrainedConfig
+
         if hasattr(model, "config") and isinstance(model.config, PretrainedConfig):
             model.config.torchscript = False
             model.config.return_dict = True
