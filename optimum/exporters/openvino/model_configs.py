@@ -203,6 +203,8 @@ from .model_patcher import (
     VideochatFlashQwenLanguageModelPatcher,
     VideochatFlashQwenVisionEmbeddingModelPatcher,
     VideochatFlashQwenVisionProjectionModelPatcher,
+    VideochatFlashQwenTokenMergingModelPatcher,
+    VideochatFlashQwenTokenMergingModuleWrapper,
     XverseModelPatcher,
     Zamba2ModelPatcher,
 )
@@ -5389,12 +5391,71 @@ class VideoChatFlashQwenProjectorOpenVINOConfig(OnnxConfig):
         model_kwargs = model_kwargs or {}
         return VideochatFlashQwenVisionProjectionModelPatcher(self, model, model_kwargs)
 
+class DummyVideoChatFlashQwenTokenMergingInputGenerator(DummyInputGenerator):
+    SUPPORTED_INPUT_NAMES = ["hidden_states", "size"]
+
+    def __init__(
+        self,
+        task: str,
+        normalized_config: NormalizedTextConfig,
+        batch_size: int = DEFAULT_DUMMY_SHAPES["batch_size"],
+        random_batch_size_range: Optional[Tuple[int, int]] = None,
+        **kwargs,
+    ):
+        self.task = task
+        self.batch_size = batch_size
+        self.hidden_size = normalized_config.config.mm_hidden_size
+        self.num_frames = normalized_config.config.mm_local_num_frames
+        self.num_patches = 16 * 16 * self.num_frames
+        # self.num_patches = 16 * 16
+        self.normalized_config = normalized_config
+        self.target_num_tokens = 16 * self.num_frames
+
+    def generate(
+        self,
+        input_name: str,
+        framework: str = "pt",
+        int_dtype: str = "int64",
+        float_dtype: str = "fp32",
+    ):
+        # if input_name == "target_num_token":
+        #     return self.constant_tensor(shape=[1], framework=framework, dtype=int_dtype, value=self.target_num_tokens)
+        #     return self.target_num_tokens
+        if input_name == "size":
+            shape = [self.batch_size, self.num_patches, 1]
+            dtype = DTYPE_MAPPER.pt(float_dtype) if framework == "pt" else DTYPE_MAPPER.np(float_dtype)
+            return self.constant_tensor(shape=shape, framework=framework, dtype=dtype, value=1)
+
+        shape = [self.batch_size, self.num_patches, self.hidden_size]
+        return self.random_float_tensor(shape, framework=framework, dtype=float_dtype)
+
+class VideoChatFlashQwenTokenMergeOpenVINOConfig(OnnxConfig):
+    DUMMY_INPUT_GENERATOR_CLASSES = (DummyVideoChatFlashQwenTokenMergingInputGenerator,)
+    NORMALIZED_CONFIG_CLASS = NormalizedVisionConfig
+
+    @property
+    def inputs(self) -> Dict[str, Dict[int, str]]:
+        return {"hidden_states": {0: "batch_size", 1: "num_patches", 2: "hidden_size"},
+                "size": {0: "batch_size", 1: "num_patches", 2: "1"}}
+
+    @property
+    def outputs(self) -> Dict[str, Dict[int, str]]:
+        return {
+            "merged_hidden_states": {0: "batch_size", 1: "num_patches", 2: "hidden_size"},
+            "merged_size": {0: "batch_size", 1: "num_patches", 2: "1"},
+        }
+
+    # def patch_model_for_export(self, model: PreTrainedModel, model_kwargs: Optional[Dict[str, Any]] = None):
+    #     model_kwargs = model_kwargs or {}
+    #     return VideochatFlashQwenTokenMergingModelPatcher(self, model, model_kwargs)
+
 
 class VideoChatFlashQwenConfigBehavior(str, enum.Enum):
     LANGUAGE = "language"
     VISION_EMBEDDINGS = "vision_embeddings"
     VISION_PROJECTION = "vision_projection"
     TEXT_EMBEDDINGS = "text_embeddings"
+    TOKEN_MERGING = "token_merging"
 
 
 @register_in_tasks_manager("videochat_flash_qwen", *["image-text-to-text"], library_name="transformers")
@@ -5475,6 +5536,14 @@ class VideoChatFlashQwenOpenVINOConfig(BaseVLMOpenVINOConfig):
                 behavior=behavior,
                 preprocessors=self._preprocessors,
             )
+        if behavior == VideoChatFlashQwenConfigBehavior.TOKEN_MERGING:
+            export_config = VideoChatFlashQwenTokenMergeOpenVINOConfig(
+                self._orig_config,
+                task="feature-extraction",
+                int_dtype=self.int_dtype,
+                float_dtype=self.float_dtype,
+            )
+            return export_config
 
     def get_model_for_behavior(self, model, behavior: Union[str, VideoChatFlashQwenConfigBehavior]):
         if isinstance(behavior, str) and not isinstance(behavior, VideoChatFlashQwenConfigBehavior):
@@ -5498,6 +5567,11 @@ class VideoChatFlashQwenOpenVINOConfig(BaseVLMOpenVINOConfig):
         if behavior == VideoChatFlashQwenConfigBehavior.LANGUAGE:
             model.model.llm_compress_layer_list = []
             return model.language_model if not hasattr(model, "lm_head") else model
+
+        if behavior == VideoChatFlashQwenConfigBehavior.TOKEN_MERGING:
+            # token_merging_module = model.get_model().mm_projector
+            # return VideochatFlashQwenTokenMergingModuleWrapper(token_merging_module, model.config)
+            return VideochatFlashQwenTokenMergingModuleWrapper(model.config)
 
     def patch_model_for_export(self, model: PreTrainedModel, model_kwargs: Optional[Dict[str, Any]] = None):
         model_kwargs = model_kwargs or {}

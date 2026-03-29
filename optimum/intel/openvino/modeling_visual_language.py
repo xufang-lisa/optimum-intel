@@ -321,6 +321,14 @@ class OVVisionProjection(OVModelPart):
         self.compile()
         return self.request(img_features)[0]
 
+class OVVisionTokenMerging(OVModelPart):
+    _model_name = "token_merging"
+
+    def forward(self, hidden_states, size):
+        self.compile()
+        result = self.request({"hidden_states": hidden_states, "size": size})
+        return result["merged_hidden_states"], result["merged_size"]
+
 
 class OVVisionResampler(OVVisionProjection):
     _model_name = "vision_resampler"
@@ -355,6 +363,7 @@ MODEL_PARTS_CLS_MAPPING = {
     "multi_modal_projector": OVMultiModalProjector,
     "vision_embeddings_merger": OVVisionEmbedding,
     "vision_embeddings_pos": OVVisionProjection,
+    "token_merging": OVVisionTokenMerging,
     "audio_embeddings": OVAudioEmbeddings,
     "audio_forward_embeddings": OVAudioEmbeddings,
     "audio_encoder": OVAudioEncoder,
@@ -4808,7 +4817,7 @@ class _OVVideoChatFlashQwenForCausalLM(OVModelForVisualCausalLM):
     from transformers import AutoModel
 
     auto_model_class = AutoModel
-    additional_parts = ["vision_projection"]
+    additional_parts = ["vision_projection", "token_merging"]
     IMAGE_TOKEN_INDEX = -200
     IGNORE_INDEX = -100
 
@@ -5062,23 +5071,18 @@ class _OVVideoChatFlashQwenForCausalLM(OVModelForVisualCausalLM):
         return x
 
     def get_vision_projection(self, x, compress=False, local_num_frames=-1):
-        height = width = self.image_size // self.patch_size
-        assert height * width == x.shape[1]
-
-        if local_num_frames != -1 and local_num_frames != 1:
-            assert compress is True
+        local_num_frames = getattr(self.config, "mm_local_num_frames", -1)
+        target_num_token = 16 * local_num_frames
         if compress:
-            if local_num_frames != -1:
-                num_frames = local_num_frames
-                x = x.reshape(x.shape[0] // local_num_frames, -1, x.shape[-1])
-            else:
-                num_frames = x.shape[0]
-                x = x.reshape(1, -1, x.shape[-1])
-            num_tome_tokens = 16 * num_frames
-        else:
-            num_tome_tokens = 64
+            x = x.reshape(x.shape[0] // local_num_frames, -1, x.shape[-1])
+        b, p, _ = x.shape
+        size = torch.ones((b, p, 1), dtype=torch.float32, device=x.device)
+        while p > target_num_token:
+            x, size = self.token_merging(x, size)
+            # x, size = bipartite_fixed_half_merge(x, size, 16)
+            b, p, _ = x.shape
 
-        x = self.merge_tokens(x, target_num_token=num_tome_tokens)
+        # x = self.token_merging(x)
         x = self.vision_projection(x)
         x = torch.from_numpy(x) if isinstance(x, np.ndarray) else x
         return x

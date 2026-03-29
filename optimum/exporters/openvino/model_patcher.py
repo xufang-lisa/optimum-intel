@@ -7715,6 +7715,176 @@ class VideochatFlashQwenVisionEmbeddingModelPatcher(ModelPatcher):
         self._model.forward = self._model.__orig_forward
 
 
+class VideochatFlashQwenTokenMergingModuleWrapper(nn.Module):
+    """nn.Module-compatible wrapper that exposes config without mutating wrapped module."""
+
+    def bipartite_fixed_half_merge(
+        hidden_states: torch.Tensor,
+        size: torch.Tensor,
+        num_heads: int = 16,
+        head_dim: int = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Fixed half-way token merging (no argsort, no unmerge).
+
+        Args:
+            hidden_states: (B, N, D) input tokens
+            size: (B, N, 1) cumulative token sizes
+            num_heads: number of attention heads
+            head_dim: head dimension; if None, inferred from D // num_heads
+
+        Returns:
+            (merged_tokens, merged_sizes) both with last dimension halved to ~N/2
+        """
+        B, N, D = hidden_states.shape
+
+        if head_dim is None:
+            head_dim = D // num_heads
+
+        # 1. Reshape and compute L2-normalized metric
+        x_heads = hidden_states.reshape(B, N, num_heads, head_dim)
+        x_mean = x_heads.mean(dim=2)  # (B, N, head_dim)
+        x_norm = x_mean / (x_mean.pow(2).sum(dim=-1, keepdim=True).sqrt() + 1e-8)
+
+        # 2. Bipartite split: src (even), dst (odd)
+        src_idx = torch.arange(0, N, step=2, device=hidden_states.device)
+        dst_idx = torch.arange(1, N, step=2, device=hidden_states.device)
+
+        x_src = x_norm[:, src_idx, :]  # (B, N_src, head_dim)
+        x_dst = x_norm[:, dst_idx, :]  # (B, N_dst, head_dim)
+
+        # 3. Compute similarity: (B, N_dst, N_src)
+        sim = torch.bmm(x_dst, x_src.transpose(1, 2))
+
+        # 4. Each dst token finds best matching src
+        _, match_idx = sim.max(dim=2)  # (B, N_dst)
+
+        # 5. Gather size-weighted tokens
+        x_weighted = hidden_states * size  # (B, N, D)
+        x_src_w = x_weighted[:, src_idx, :]  # (B, N_src, D)
+        x_dst_w = x_weighted[:, dst_idx, :]  # (B, N_dst, D)
+
+        size_src = size[:, src_idx, :]  # (B, N_src, 1)
+        size_dst = size[:, dst_idx, :]  # (B, N_dst, 1)
+
+        # 6. Scatter-add to accumulate sizes and weighted tokens
+        idx_for_size = match_idx.unsqueeze(-1)  # (B, N_dst, 1)
+        idx_for_feat = match_idx.unsqueeze(-1).expand_as(x_dst_w)  # (B, N_dst, D)
+
+        size_out = size_src.scatter_add(1, idx_for_size, size_dst)
+        x_out_w = x_src_w.scatter_add(1, idx_for_feat, x_dst_w)
+
+        # 7. Weighted average
+        x_out = x_out_w / (size_out + 1e-8)
+
+        return x_out, size_out
+
+    # def __init__(self, module, config):
+    #     super().__init__()
+    #     self.module = module
+    #     self._config = config
+
+    def __init__(self, config):
+        super().__init__()
+        self._config = config
+
+    @property
+    def config(self):
+        return self._config
+
+    def forward(self, hidden_states, size):
+        return VideochatFlashQwenTokenMergingModuleWrapper.bipartite_fixed_half_merge(hidden_states, size, 16)
+        # return self.module(*args, **kwargs)
+
+class VideochatFlashQwenTokenMergingModelPatcher(ModelPatcher):
+    def __init__(
+        self,
+        config: "OnnxConfig",
+        model: "PreTrainedModel",
+        model_kwargs: Dict[str, Any] = None,
+    ):
+        model.__orig_forward = model.forward
+
+        def bipartite_fixed_half_merge(
+            hidden_states: torch.Tensor,
+            size: torch.Tensor,
+            num_heads: int = 16,
+            head_dim: int = None,
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+            """
+            Fixed half-way token merging (no argsort, no unmerge).
+
+            Args:
+                hidden_states: (B, N, D) input tokens
+                size: (B, N, 1) cumulative token sizes
+                num_heads: number of attention heads
+                head_dim: head dimension; if None, inferred from D // num_heads
+
+            Returns:
+                (merged_tokens, merged_sizes) both with last dimension halved to ~N/2
+            """
+            B, N, D = hidden_states.shape
+
+            if head_dim is None:
+                head_dim = D // num_heads
+
+            # 1. Reshape and compute L2-normalized metric
+            x_heads = hidden_states.reshape(B, N, num_heads, head_dim)
+            x_mean = x_heads.mean(dim=2)  # (B, N, head_dim)
+            x_norm = x_mean / (x_mean.pow(2).sum(dim=-1, keepdim=True).sqrt() + 1e-8)
+
+            # 2. Bipartite split: src (even), dst (odd)
+            src_idx = torch.arange(0, N, step=2, device=hidden_states.device)
+            dst_idx = torch.arange(1, N, step=2, device=hidden_states.device)
+
+            x_src = x_norm[:, src_idx, :]  # (B, N_src, head_dim)
+            x_dst = x_norm[:, dst_idx, :]  # (B, N_dst, head_dim)
+
+            # 3. Compute similarity: (B, N_dst, N_src)
+            sim = torch.bmm(x_dst, x_src.transpose(1, 2))
+
+            # 4. Each dst token finds best matching src
+            _, match_idx = sim.max(dim=2)  # (B, N_dst)
+
+            # 5. Gather size-weighted tokens
+            x_weighted = hidden_states * size  # (B, N, D)
+            x_src_w = x_weighted[:, src_idx, :]  # (B, N_src, D)
+            x_dst_w = x_weighted[:, dst_idx, :]  # (B, N_dst, D)
+
+            size_src = size[:, src_idx, :]  # (B, N_src, 1)
+            size_dst = size[:, dst_idx, :]  # (B, N_dst, 1)
+
+            # 6. Scatter-add to accumulate sizes and weighted tokens
+            idx_for_size = match_idx.unsqueeze(-1)  # (B, N_dst, 1)
+            idx_for_feat = match_idx.unsqueeze(-1).expand_as(x_dst_w)  # (B, N_dst, D)
+
+            size_out = size_src.scatter_add(1, idx_for_size, size_dst)
+            x_out_w = x_src_w.scatter_add(1, idx_for_feat, x_dst_w)
+
+            # 7. Weighted average
+            x_out = x_out_w / (size_out + 1e-8)
+
+            return x_out, size_out
+
+        def forward_wrap(self, hidden_states):
+            local_num_frames = getattr(self.config, "mm_local_num_frames", -1)
+            target_num_token = 16 * local_num_frames
+            # b, p, _ = hidden_states.shape
+            # size = torch.ones((b, p, 1), dtype=torch.float32, device=hidden_states.device)
+            # while p > target_num_token:
+            #     hidden_states, size = bipartite_fixed_half_merge(hidden_states, size, 16)
+            #     b, p, _ = hidden_states.shape
+            # return hidden_states
+            # return self.module.merge_tokens(hidden_states, target_num_token = target_num_token)
+
+        model.forward = types.MethodType(forward_wrap, model)
+        super().__init__(config, model, model_kwargs)
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        super().__exit__(exc_type, exc_value, traceback)
+        self._model.forward = self._model.__orig_forward
+
+
 class VideochatFlashQwenVisionProjectionModelPatcher(ModelPatcher):
     def __init__(
         self,
