@@ -7719,27 +7719,27 @@ class VideochatFlashQwenTokenMergingModuleWrapper(nn.Module):
     """nn.Module-compatible wrapper that exposes config without mutating wrapped module."""
 
     def bipartite_fixed_half_merge(
+        self,
         hidden_states: torch.Tensor,
+        merge_count: int,
         size: torch.Tensor,
         num_heads: int = 16,
-        head_dim: int = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Fixed half-way token merging (no argsort, no unmerge).
 
         Args:
             hidden_states: (B, N, D) input tokens
+            merge_count: number of odd tokens to merge into even tokens; if -1, merge half of the tokens
             size: (B, N, 1) cumulative token sizes
             num_heads: number of attention heads
-            head_dim: head dimension; if None, inferred from D // num_heads
 
         Returns:
             (merged_tokens, merged_sizes) both with last dimension halved to ~N/2
         """
         B, N, D = hidden_states.shape
 
-        if head_dim is None:
-            head_dim = D // num_heads
+        head_dim = D // num_heads
 
         # 1. Reshape and compute L2-normalized metric
         x_heads = hidden_states.reshape(B, N, num_heads, head_dim)
@@ -7779,22 +7779,133 @@ class VideochatFlashQwenTokenMergingModuleWrapper(nn.Module):
 
         return x_out, size_out
 
-    # def __init__(self, module, config):
-    #     super().__init__()
-    #     self.module = module
-    #     self._config = config
+    def bipartite_soft_matching_merge_wavg(
+        self,
+        hidden_states: torch.Tensor,
+        merge_count: int,
+        size: torch.Tensor,
+        num_heads: int = 16,
+    ):
+        """
+        Fully equivalent to:
+            metric = x.reshape(b, p, head, dim).mean(2)
+            merge, _ = bipartite_soft_matching(metric, r)
+            x, size = merge_wavg(merge, x, size)
+
+        Args:
+            hidden_states: (B, N, D) token embeddings
+            merge_count: number of odd tokens to merge into even tokens
+            size: (B, N, 1) token sizes; initialized to ones if None
+            num_heads: number of attention heads for metric computation
+
+        Returns:
+            (merged_hidden_states, merged_size) with shape
+            (B, N - merge_count, D) and (B, N - merge_count, 1)
+        """
+        B, N, D = hidden_states.shape
+        head_dim = D // num_heads
+
+        # Initialize size
+        if size is None:
+            size = torch.ones((B, N, 1), dtype=hidden_states.dtype, device=hidden_states.device)
+
+        # ===== Step 1: bipartite_soft_matching (computes merge & unmerge closures) =====
+        with torch.no_grad():
+            # Compute metric: mean over attention heads
+            # metric shape: (B, N, head_dim)
+            metric = hidden_states.reshape(B, N, num_heads, head_dim).mean(dim=2)
+
+            # Normalize metric: metric / metric.norm(dim=-1, keepdim=True)
+            metric_norm = metric / (metric.norm(dim=-1, keepdim=True) + 1e-8)
+
+            # Bipartite split: even (a) and odd (b) indices
+            a = metric_norm[:, ::2, :]        # (B, ceil(N/2), head_dim)
+            b = metric_norm[:, 1::2, :]       # (B, floor(N/2), head_dim)
+
+            # Compute similarity: (B, N_a, N_b)
+            scores = torch.bmm(a, b.transpose(1, 2))
+
+            # Find best match for each a: node_idx (B, N_a) - best b index for each a
+            # node_max (B, N_a) - similarity score
+            node_max, node_idx = scores.max(dim=2)
+
+            # Rank a by their max similarity score (descending)
+            edge_idx = node_max.argsort(dim=-1, descending=True)
+
+            # Clamp merge_count to valid range
+            N_a = a.shape[1]
+            merge_count = min(merge_count, (N_a - 1) // 2)
+            merge_count = max(merge_count, 1)  # Must merge at least 1
+
+            # src_idx: top merge_count a's to be merged (indexed in a's space)
+            # unm_idx: remaining a's to keep unmerged
+            src_idx = edge_idx[:, :merge_count]      # (B, merge_count)
+            unm_idx = edge_idx[:, merge_count:]      # (B, N_a - merge_count)
+
+            # Gather corresponding b indices for src_idx a's
+            # dst_idx: which b's these selected a's will merge into (indexed in b's space)
+            dst_idx = node_idx.gather(-1, src_idx)  # (B, merge_count)
+
+        # ===== Step 2: merge_wavg (applies the merge and average functions) =====
+        # Weight hidden states by size
+        x_weighted = hidden_states * size  # (B, N, D)
+
+        # Split into even (a) and odd (b) - same split as metric computation
+        x_even = hidden_states[:, ::2, :]      # (B, N_a, D)
+        x_odd = hidden_states[:, 1::2, :]      # (B, N_b, D)
+
+        x_even_w = x_weighted[:, ::2, :]       # (B, N_a, D)
+        x_odd_w = x_weighted[:, 1::2, :]       # (B, N_b, D)
+
+        size_even = size[:, ::2, :]             # (B, N_a, 1)
+        size_odd = size[:, 1::2, :]             # (B, N_b, 1)
+
+        # ===== Compute merge() output (inlined) =====
+        # Original merge function logic:
+        # def merge(x) -> (B, N_a - merge_count + N_b, D):
+        #     src, dst = x[::2], x[1::2]
+        #     unm = src.gather(unm_idx)              # (B, N_a - merge_count, D)
+        #     src_gathered = src.gather(src_idx)    # (B, merge_count, D)
+        #     dst = dst.scatter_add(src_gathered, dst_idx)
+        #     return [unm, dst]
+
+        # Gather unmerged even tokens
+        unm_even_w = x_even_w.gather(1, unm_idx.unsqueeze(-1).expand(B, -1, D))  # (B, N_a - merge_count, D)
+        size_unm = size_even.gather(1, unm_idx.unsqueeze(-1))  # (B, N_a - merge_count, 1)
+
+        # Gather tokens to be merged from even
+        src_even_w = x_even_w.gather(1, src_idx.unsqueeze(-1).expand(B, -1, D))  # (B, merge_count, D)
+        src_size = size_even.gather(1, src_idx.unsqueeze(-1))  # (B, merge_count, 1)
+
+        # Initialize dst output from odd tokens
+        dst_w_out = x_odd_w.clone()  # (B, N_b, D)
+        size_dst_out = size_odd.clone()  # (B, N_b, 1)
+
+        # Scatter-add merged even tokens into their matching odd positions
+        dst_w_out.scatter_add_(1, dst_idx.unsqueeze(-1).expand(B, -1, D), src_even_w)
+        size_dst_out.scatter_add_(1, dst_idx.unsqueeze(-1), src_size)
+
+        # Concatenate: [unmerged_even, merged_odd]
+        x_merged_w = torch.cat([unm_even_w, dst_w_out], dim=1)  # (B, N_a - merge_count + N_b, D)
+        size_merged = torch.cat([size_unm, size_dst_out], dim=1)  # (B, N_a - merge_count + N_b, 1)
+
+        # ===== Step 3: Weighted average (divide by size) =====
+        x_merged = x_merged_w / (size_merged + 1e-8)
+
+        return x_merged, size_merged
 
     def __init__(self, config):
         super().__init__()
         self._config = config
+        self.num_heads = getattr(config, "mm_num_attention_heads", 16)
 
     @property
     def config(self):
         return self._config
 
-    def forward(self, hidden_states, size):
-        return VideochatFlashQwenTokenMergingModuleWrapper.bipartite_fixed_half_merge(hidden_states, size, 16)
-        # return self.module(*args, **kwargs)
+    def forward(self, hidden_states, merge_count, size):
+        # return self.bipartite_fixed_half_merge(hidden_states, merge_count=merge_count, size=size, num_heads=self.num_heads)
+        return self.bipartite_soft_matching_merge_wavg(hidden_states, merge_count=merge_count, size=size, num_heads=self.num_heads)
 
 class VideochatFlashQwenTokenMergingModelPatcher(ModelPatcher):
     def __init__(

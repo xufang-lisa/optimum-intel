@@ -324,10 +324,10 @@ class OVVisionProjection(OVModelPart):
 class OVVisionTokenMerging(OVModelPart):
     _model_name = "token_merging"
 
-    def forward(self, hidden_states, size):
+    def forward(self, hidden_states, merge_count, size):
         self.compile()
-        result = self.request({"hidden_states": hidden_states, "size": size})
-        return result["merged_hidden_states"], result["merged_size"]
+        result = self.request({"hidden_states": hidden_states, "merge_count": merge_count, "size": size})
+        return result["x_out"], result["size_out"]
 
 
 class OVVisionResampler(OVVisionProjection):
@@ -5077,10 +5077,18 @@ class _OVVideoChatFlashQwenForCausalLM(OVModelForVisualCausalLM):
             x = x.reshape(x.shape[0] // local_num_frames, -1, x.shape[-1])
         b, p, _ = x.shape
         size = torch.ones((b, p, 1), dtype=torch.float32, device=x.device)
-        while p > target_num_token:
-            x, size = self.token_merging(x, size)
-            # x, size = bipartite_fixed_half_merge(x, size, 16)
-            b, p, _ = x.shape
+        tmp_p = p
+        r_merge_list = []
+        while tmp_p != target_num_token:
+            if tmp_p - target_num_token <= (tmp_p // 2):
+                r_merge_list.append(tmp_p - target_num_token)
+                break
+            else:
+                r_merge_list.append(tmp_p // 2)
+                tmp_p = tmp_p - (tmp_p // 2)
+
+        for r in r_merge_list:
+            x, size = self.token_merging(x, r, size)
 
         # x = self.token_merging(x)
         x = self.vision_projection(x)

@@ -5392,7 +5392,7 @@ class VideoChatFlashQwenProjectorOpenVINOConfig(OnnxConfig):
         return VideochatFlashQwenVisionProjectionModelPatcher(self, model, model_kwargs)
 
 class DummyVideoChatFlashQwenTokenMergingInputGenerator(DummyInputGenerator):
-    SUPPORTED_INPUT_NAMES = ["hidden_states", "size"]
+    SUPPORTED_INPUT_NAMES = ["hidden_states", "merge_count","size"]
 
     def __init__(
         self,
@@ -5426,6 +5426,11 @@ class DummyVideoChatFlashQwenTokenMergingInputGenerator(DummyInputGenerator):
             dtype = DTYPE_MAPPER.pt(float_dtype) if framework == "pt" else DTYPE_MAPPER.np(float_dtype)
             return self.constant_tensor(shape=shape, framework=framework, dtype=dtype, value=1)
 
+        if input_name == "merge_count":
+            shape = []
+            dtype = DTYPE_MAPPER.pt(int_dtype) if framework == "pt" else DTYPE_MAPPER.np(int_dtype)
+            return self.constant_tensor(shape=shape, framework=framework, dtype=dtype, value=self.num_patches // self.target_num_tokens)
+
         shape = [self.batch_size, self.num_patches, self.hidden_size]
         return self.random_float_tensor(shape, framework=framework, dtype=float_dtype)
 
@@ -5436,13 +5441,14 @@ class VideoChatFlashQwenTokenMergeOpenVINOConfig(OnnxConfig):
     @property
     def inputs(self) -> Dict[str, Dict[int, str]]:
         return {"hidden_states": {0: "batch_size", 1: "num_patches", 2: "hidden_size"},
+                "merge_count":{},
                 "size": {0: "batch_size", 1: "num_patches", 2: "1"}}
 
     @property
     def outputs(self) -> Dict[str, Dict[int, str]]:
         return {
-            "merged_hidden_states": {0: "batch_size", 1: "num_patches", 2: "hidden_size"},
-            "merged_size": {0: "batch_size", 1: "num_patches", 2: "1"},
+            "x_out": {0: "batch_size", 1: "num_patches", 2: "hidden_size"},
+            "size_out": {0: "batch_size", 1: "num_patches", 2: "1"},
         }
 
     # def patch_model_for_export(self, model: PreTrainedModel, model_kwargs: Optional[Dict[str, Any]] = None):
