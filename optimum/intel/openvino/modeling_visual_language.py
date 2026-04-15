@@ -4812,6 +4812,30 @@ class _OVVideoChatFlashQwenForCausalLM(OVModelForVisualCausalLM):
     # Copied from https://huggingface.co/OpenGVLab/VideoChat-Flash-Qwen2_5-7B_InternVideo2-1B/blob/main/constants.py#L7
     IGNORE_INDEX = -100
 
+    # Keep `modalities` compatibility local to VideoChat-Flash.
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+        past_key_values=None,
+        inputs_embeds=None,
+        pixel_values=None,
+        image_sizes=None,
+        modalities=None,
+        attention_mask=None,
+        **kwargs,
+    ):
+        model_inputs = super().prepare_inputs_for_generation(
+            input_ids=input_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            pixel_values=pixel_values,
+            image_sizes=image_sizes,
+            attention_mask=attention_mask,
+            **kwargs,
+        )
+        model_inputs["modalities"] = modalities
+        return model_inputs
+
     # Adapted from https://huggingface.co/OpenGVLab/VideoChat-Flash-Qwen2_5-7B_InternVideo2-1B/blob/main/vision_tower_builder.py#L181-L226
     # Use torch instead of numpy to align with the other models.
     def get_3d_sincos_pos_embed(embed_dim, grid_size, t_size, cls_token=False):
@@ -5212,11 +5236,120 @@ class _OVVideoChatFlashQwenForCausalLM(OVModelForVisualCausalLM):
             raise ValueError("Tokenizer is required.")
         image_sizes = []
         frames = []
+        modalities = []
         results = {}
         local_num_frames = config.mm_local_num_frames
 
+        def _infer_hw(sample):
+            from PIL.Image import Image as PILImage
+
+            if isinstance(sample, np.ndarray):
+                return tuple(sample.shape[:2])
+            if isinstance(sample, PILImage):
+                width, height = sample.size
+                return (height, width)
+            raise ValueError(f"Unsupported frame/image type: {type(sample)}")
+
+        def _normalize_video_inputs(video_data):
+            if video_data is None:
+                return []
+
+            normalized = []
+
+            def _append_video(video_frames):
+                if len(video_frames) == 0:
+                    raise ValueError("Video input list must not be empty")
+                image_size = _infer_hw(video_frames[0])
+                padded_frames = list(video_frames)
+                if len(padded_frames) % local_num_frames != 0:
+                    pad_frames = local_num_frames - (len(padded_frames) % local_num_frames)
+                    padded_frames = padded_frames + [padded_frames[-1]] * pad_frames
+                normalized.append({"frames": padded_frames, "image_size": image_size})
+
+            print(f'video_data type: {type(video_data)}')
+            if isinstance(video_data, np.ndarray):
+                print(f'video_data shape: {video_data.shape}')
+                if video_data.ndim == 4:
+                    _append_video(list(video_data))
+                    return normalized
+                if video_data.ndim == 5:
+                    for i in range(video_data.shape[0]):
+                        _append_video(list(video_data[i]))
+                    return normalized
+                raise ValueError(f"Unsupported video ndarray shape: {video_data.shape}")
+
+            if isinstance(video_data, (list, tuple)):
+                if len(video_data) == 0:
+                    raise ValueError("Video input list must not be empty")
+
+                first_item = video_data[0]
+                print(f'first_item type: {type(first_item)}')
+                if isinstance(first_item, np.ndarray):
+                    # List of frames for a single video.
+                    print(f'first_item shape: {first_item.shape}')
+                    if first_item.ndim == 3:
+                        _append_video(list(video_data))
+                        return normalized
+                    # List of per-video ndarray inputs.
+                    if first_item.ndim == 4:
+                        for v in video_data:
+                            _append_video(list(v))
+                        return normalized
+                    raise ValueError(f"Unsupported video frame ndim: {first_item.ndim}")
+
+                if isinstance(first_item, (list, tuple)):
+                    # List of frame lists for multiple videos.
+                    print(f'first_item is list/tuple, length: {len(first_item)}')
+                    for v in video_data:
+                        print(f'video frames type: {type(v)}, length: {len(v)}')
+                        for frame in v:
+                            print(f'frame type: {type(frame)}, frame shape: {getattr(frame, "shape", "N/A")}')
+                        _append_video(list(v))
+                    return normalized
+
+                from PIL.Image import Image as PILImage
+
+                if isinstance(first_item, PILImage):
+                    print(f'first_item is PIL Image, size: {first_item.size}')
+                    _append_video(list(video_data))
+                    return normalized
+
+            raise ValueError(f"Unsupported video type: {type(video_data)}")
+
+        if image is None:
+            image_inputs = []
+        elif isinstance(image, (list, tuple)):
+            print(f'image input is list/tuple, length: {len(image)}')
+            image_inputs = list(image)
+            if len(image_inputs) == 0:
+                raise ValueError("Image input list must not be empty")
+        else:
+            print(f'image input type: {type(image)}')
+            image_inputs = [image]
+
+        video_inputs = _normalize_video_inputs(video)
+        visual_inputs = [
+            {"frames": single_video["frames"], "image_size": single_video["image_size"], "modality": "video"}
+            for single_video in video_inputs
+        ]
+        visual_inputs.extend(
+            {"frames": [current_image], "image_size": _infer_hw(current_image), "modality": "image"}
+            for current_image in image_inputs
+        )
+        num_visual_inputs = len(visual_inputs)
+
         # preprocess text
-        prompt = f"<image>\n{text}" if (image is not None or video is not None) else text
+        if num_visual_inputs > 0:
+            if "<image>" in text:
+                prompt = text
+                if text.count("<image>") != num_visual_inputs:
+                    raise ValueError(
+                        f"Expected {num_visual_inputs} <image> placeholder(s) in text, got {text.count('<image>')}"
+                    )
+            else:
+                prompt = "<image>\n" * num_visual_inputs + text
+        else:
+            prompt = text
         if getattr(tokenizer, "chat_template", None) is not None:
             messages = [{"role": "user", "content": prompt}]
             text_prompt = tokenizer.apply_chat_template(
@@ -5231,54 +5364,19 @@ class _OVVideoChatFlashQwenForCausalLM(OVModelForVisualCausalLM):
         ).unsqueeze(0)
         results["input_ids"] = input_ids
 
-        # preprocess video
-        if video is not None:
-            if isinstance(video, np.ndarray):
-                num_frames = video.shape[0]
-                image_size = video.shape[1:3]
-                if num_frames % local_num_frames != 0:
-                    pad_frames = local_num_frames - (num_frames % local_num_frames)
-                    pad = np.repeat(video[-1:], pad_frames, axis=0)
-                    video = np.concatenate([video, pad], axis=0)
-            elif isinstance(video, list):
-                num_frames = len(video)
-                if isinstance(video[0], np.ndarray):
-                    image_size = video[0].shape[:2]
-                else:
-                    width, height = video[0].size
-                    image_size = (height, width)
-                if num_frames % local_num_frames != 0:
-                    pad_frames = local_num_frames - (num_frames % local_num_frames)
-                    video = video + [video[-1]] * pad_frames
-            else:
-                raise ValueError("Unsupported video type: {}".format(type(video)))
-
-            image_sizes.append(image_size)
+        for visual_input in visual_inputs:
+            image_sizes.append(visual_input["image_size"])
             if processor is not None:
-                processed_images = processor(images=video, return_tensors="pt")
+                processed_images = processor(images=visual_input["frames"], return_tensors="pt")
             else:
-                processed_images = _OVVideoChatFlashQwenForCausalLM.image_preprocess(images=video)
+                processed_images = _OVVideoChatFlashQwenForCausalLM.image_preprocess(images=visual_input["frames"])
             frames.append(processed_images)
-
-        # preprocess image
-        if image is not None:
-            from PIL.Image import Image as PILImage
-
-            if isinstance(image, PILImage):
-                width, height = image.size
-                image_size = (height, width)
-            else:
-                image_size = image.shape[:2]
-            if processor is not None:
-                image_frame = processor(images=image, return_tensors="pt")
-            else:
-                image_frame = _OVVideoChatFlashQwenForCausalLM.image_preprocess(images=image)
-            frames.append(image_frame)
-            image_sizes.append(image_size)
+            modalities.append(visual_input["modality"])
 
         if len(frames) >= 1:
             results["images"] = frames
             results["image_sizes"] = image_sizes
+            results["modalities"] = modalities
 
         if tokenizer.pad_token_id is None:
             if "qwen" in tokenizer.name_or_path.lower():
@@ -5471,6 +5569,8 @@ class _OVVideoChatFlashQwenForCausalLM(OVModelForVisualCausalLM):
 
         if isinstance(images, list):
             images = [x.unsqueeze(0) if x.ndim == 3 else x for x in images]
+            for image in images:
+                print(f'image shape: {image.shape}')
             if modalities is None:
                 modalities = []
                 for image in images:
