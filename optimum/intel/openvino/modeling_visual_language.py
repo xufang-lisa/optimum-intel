@@ -4852,10 +4852,10 @@ class _OVVideoChatFlashQwenForCausalLM(OVModelForVisualCausalLM):
         return module
 
     @staticmethod
-    def _ensure_external_tokenizer_image_token_loaded(config=None, model_dir=None):
+    def _ensure_external_tokenizer_image_token_loaded(model_name_or_path=None):
         # Lazy-load tokenizer_image_token from mm_utils.py.
-        # Searches model_dir first (if given), then config._name_or_path as a local path,
-        # then falls back to HuggingFace Hub. Caches the callable on the class.
+        # Searches model_name_or_path as a local path, then falls back to HuggingFace Hub.
+        # Caches the callable on the class.
         module_func = _OVVideoChatFlashQwenForCausalLM._external_tokenizer_image_token
         if callable(module_func):
             return module_func
@@ -4874,21 +4874,16 @@ class _OVVideoChatFlashQwenForCausalLM(OVModelForVisualCausalLM):
             if path.is_dir() and (path / "mm_utils.py").is_file():
                 candidate_dirs.append(path)
 
-        # Direct model directory takes priority over config._name_or_path
-        if model_dir is not None:
-            _add_candidate(model_dir)
-
-        model_path = getattr(config, "_name_or_path", None) if config is not None else None
-
-        if model_path:
+        if model_name_or_path:
             # Try as local path first
-            _add_candidate(model_path)
+            _add_candidate(model_name_or_path)
 
             # If not a local path, try as repo_id from HuggingFace Hub
-            if not candidate_dirs and not str(model_path).startswith("/"):
+            if not candidate_dirs and not str(model_name_or_path).startswith("/"):
                 try:
-                    mm_utils_file = hf_hub_download(repo_id=model_path, filename="mm_utils.py")
-                    hf_hub_download(repo_id=model_path, filename="constants.py")
+                    mm_utils_file = hf_hub_download(repo_id=model_name_or_path, filename="mm_utils.py")
+                    # Download constants.py along with mm_utils to satisfy mm_utils.py's relative import: from .constants import IMAGE_TOKEN_INDEX
+                    hf_hub_download(repo_id=model_name_or_path, filename="constants.py")
                     _add_candidate(Path(mm_utils_file).parent)
                 except Exception:
                     pass
@@ -4897,21 +4892,32 @@ class _OVVideoChatFlashQwenForCausalLM(OVModelForVisualCausalLM):
             source_file = source_dir / "mm_utils.py"
             constants_file = source_dir / "constants.py"
             try:
+                package_name = f"_videochat_external_pkg_{abs(hash(str(source_dir.resolve())))}"
+                package = sys.modules.get(package_name)
+                if package is None:
+                    package = types.ModuleType(package_name)
+                    package.__path__ = [str(source_dir)]
+                    sys.modules[package_name] = package
+
                 if constants_file.is_file():
-                    existing_constants = sys.modules.get("constants")
+                    # Load constants.py as a module in the synthetic package namespace before loading mm_utils.
+                    # This is required because mm_utils.py contains relative imports like "from .constants import IMAGE_TOKEN_INDEX".
+                    # Without pre-loading constants into sys.modules, the relative import in mm_utils will fail.
+                    constants_module_name = f"{package_name}.constants"
+                    existing_constants = sys.modules.get(constants_module_name)
                     existing_constants_file = (
                         Path(getattr(existing_constants, "__file__", "")).resolve() if existing_constants else None
                     )
                     if existing_constants is None or existing_constants_file != constants_file.resolve():
-                        constants_spec = importlib.util.spec_from_file_location("constants", str(constants_file))
+                        constants_spec = importlib.util.spec_from_file_location(constants_module_name, str(constants_file))
                         if constants_spec is None or constants_spec.loader is None:
                             raise ValueError(f"Unable to create module spec from {constants_file}")
 
                         constants_module = importlib.util.module_from_spec(constants_spec)
-                        sys.modules["constants"] = constants_module
+                        sys.modules[constants_module_name] = constants_module
                         constants_spec.loader.exec_module(constants_module)
 
-                module_name = f"_videochat_external_mm_utils_{abs(hash(str(source_file)))}"
+                module_name = f"{package_name}.mm_utils"
                 module = _OVVideoChatFlashQwenForCausalLM._load_module_from_file(source_file, module_name)
                 module_func = getattr(module, "tokenizer_image_token", None)
                 if callable(module_func):
@@ -4923,31 +4929,35 @@ class _OVVideoChatFlashQwenForCausalLM(OVModelForVisualCausalLM):
         raise ValueError("tokenizer_image_token is not loaded and automatic loading failed.")
 
     @staticmethod
-    def _ensure_external_image_processor_class_loaded(config=None):
-        # Lazy-load InternVideo2ImageProcessor from vision_tower_builder.py via config._name_or_path.
+    def _ensure_external_image_processor_class_loaded(model_name_or_path=None):
+        # Lazy-load InternVideo2ImageProcessor from vision_tower_builder.py.
         # Prefer local model files first, then fall back to HuggingFace Hub, and cache the class.
         processor_class = _OVVideoChatFlashQwenForCausalLM._external_image_processor_class
         if processor_class is not None:
             return processor_class
 
         candidate_dirs = []
-        model_path = getattr(config, "_name_or_path", None) if config is not None else None
 
-        if model_path:
-            # Try as local path first
+        def _add_candidate(value):
+            if not value:
+                return
             try:
-                path = Path(model_path).resolve()
-                if path.is_file():
-                    path = path.parent
-                if path.is_dir() and (path / "vision_tower_builder.py").is_file():
-                    candidate_dirs.append(path)
+                path = Path(value).resolve()
             except Exception:
-                pass
+                return
+            if path.is_file():
+                path = path.parent
+            if path.is_dir() and (path / "vision_tower_builder.py").is_file():
+                candidate_dirs.append(path)
+
+        if model_name_or_path:
+            # Try as local path first
+            _add_candidate(model_name_or_path)
 
             # If not a local path, try as repo_id from HuggingFace Hub
-            if not candidate_dirs and not str(model_path).startswith("/"):
+            if not candidate_dirs and not str(model_name_or_path).startswith("/"):
                 try:
-                    source_file = hf_hub_download(repo_id=model_path, filename="vision_tower_builder.py")
+                    source_file = hf_hub_download(repo_id=model_name_or_path, filename="vision_tower_builder.py")
                     candidate_dirs.append(Path(source_file).parent)
                 except Exception:
                     pass
@@ -5007,7 +5017,7 @@ class _OVVideoChatFlashQwenForCausalLM(OVModelForVisualCausalLM):
     # Load tokenizer_image_token helper from upstream file.
     def _load_from_mm_utils(self, model_save_dir) -> None:
         model_dir = model_save_dir.name if isinstance(model_save_dir, TemporaryDirectory) else model_save_dir
-        self._ensure_external_tokenizer_image_token_loaded(model_dir=model_dir)
+        self._ensure_external_tokenizer_image_token_loaded(model_name_or_path=model_dir)
 
     # Load and cache the upstream LlavaMetaForCausalLM base class used by the local adapter.
     def _load_from_modeling_videochat_flash(self, model_save_dir) -> None:
@@ -5246,7 +5256,9 @@ class _OVVideoChatFlashQwenForCausalLM(OVModelForVisualCausalLM):
         results = {}
         local_num_frames = config.mm_local_num_frames
         if image is not None or video is not None:
-            _OVVideoChatFlashQwenForCausalLM._ensure_external_image_processor_class_loaded(config=config)
+            _OVVideoChatFlashQwenForCausalLM._ensure_external_image_processor_class_loaded(
+                model_name_or_path=getattr(config, "_name_or_path", None)
+            )
             # use default image_size from https://huggingface.co/OpenGVLab/VideoChat-Flash-Qwen2_5-7B_InternVideo2-1B/blob/main/vision_tower_builder.py#L682
             target_image_size = getattr(config, "image_size", 224)
             target_size = (target_image_size, target_image_size) if target_image_size is not None else None
@@ -5266,7 +5278,7 @@ class _OVVideoChatFlashQwenForCausalLM(OVModelForVisualCausalLM):
         else:
             text_prompt = prompt
         module_func = _OVVideoChatFlashQwenForCausalLM._ensure_external_tokenizer_image_token_loaded(
-            config=config
+            model_name_or_path=getattr(tokenizer, "name_or_path", None)
         )
         input_ids = module_func(
             text_prompt,
