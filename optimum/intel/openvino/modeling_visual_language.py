@@ -1,9 +1,13 @@
 import copy
 import enum
+import importlib
+import importlib.util
 import inspect
 import logging
 import math
 import os
+import sys
+import types
 import warnings
 from abc import abstractmethod
 from dataclasses import dataclass
@@ -20,6 +24,7 @@ from openvino._offline_transformations import apply_moc_transformations, compres
 from transformers import (
     AutoConfig,
     AutoImageProcessor,
+    AutoModel,
     GenerationConfig,
     GenerationMixin,
     PretrainedConfig,
@@ -4802,6 +4807,621 @@ class _OVLlama4ForCausalLM(OVModelForVisualCausalLM):
         return inputs
 
 
+class _OVVideoChatFlashQwenForCausalLM(OVModelForVisualCausalLM):
+    auto_model_class = AutoModel
+    additional_parts = ["vision_projection"]
+    _external_image_processor_class = None
+    _external_projector_class = None
+    _external_videochat_base_class = None
+    _external_tokenizer_image_token = None
+
+    @staticmethod
+    def _to_torch(value):
+        if isinstance(value, np.ndarray):
+            return torch.from_numpy(value)
+        if isinstance(value, list):
+            value = [torch.from_numpy(item) if isinstance(item, np.ndarray) else item for item in value]
+            if value and all(torch.is_tensor(item) for item in value):
+                return torch.stack(value, dim=0)
+        return value
+
+    @staticmethod
+    def _resolve_source_file(model_save_dir, source_filename: str, raise_on_error: bool = True) -> Optional[Path]:
+        normalized_value = model_save_dir.name if isinstance(model_save_dir, TemporaryDirectory) else model_save_dir
+        if not normalized_value:
+            if raise_on_error:
+                raise ValueError(f"model_save_dir is required to load {source_filename}")
+            return None
+        try:
+            model_dir_path = Path(normalized_value).resolve()
+        except Exception:
+            if raise_on_error:
+                raise ValueError(f"Invalid model_save_dir: {normalized_value}")
+            return None
+
+        if model_dir_path.is_file():
+            model_dir_path = model_dir_path.parent
+
+        source_file = model_dir_path / source_filename
+        if not source_file.is_file():
+            if raise_on_error:
+                raise ValueError(f"Source file was not found: {source_file}")
+            return None
+        return source_file
+
+    @staticmethod
+    def _load_module_from_file(source_file: Path, module_name: str):
+        module = sys.modules.get(module_name)
+        if module is not None:
+            return module
+        spec = importlib.util.spec_from_file_location(module_name, str(source_file))
+        if spec is None or spec.loader is None:
+            raise ValueError(f"Unable to create module spec from {source_file}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        return module
+
+    @staticmethod
+    def _load_external_tokenizer_image_token(model_name_or_path=None):
+        # Lazy-load tokenizer_image_token from mm_utils.py.
+        # Searches model_name_or_path as a local path, then falls back to HuggingFace Hub.
+        # Caches the callable on the class.
+        module_func = _OVVideoChatFlashQwenForCausalLM._external_tokenizer_image_token
+        if callable(module_func):
+            return module_func
+
+        candidate_dirs = []
+
+        if model_name_or_path:
+            # Try as local path first
+            source_file = _OVVideoChatFlashQwenForCausalLM._resolve_source_file(
+                model_name_or_path, "mm_utils.py", raise_on_error=False
+            )
+            if source_file is not None and source_file.parent not in candidate_dirs:
+                candidate_dirs.append(source_file.parent)
+
+            # If not a local path, try as repo_id from HuggingFace Hub
+            if not candidate_dirs and not str(model_name_or_path).startswith("/"):
+                try:
+                    mm_utils_file = hf_hub_download(repo_id=model_name_or_path, filename="mm_utils.py")
+                    # Download constants.py along with mm_utils to satisfy mm_utils.py's relative import: from .constants import IMAGE_TOKEN_INDEX
+                    hf_hub_download(repo_id=model_name_or_path, filename="constants.py")
+                    source_file = _OVVideoChatFlashQwenForCausalLM._resolve_source_file(
+                        Path(mm_utils_file).parent, "mm_utils.py", raise_on_error=False
+                    )
+                    if source_file is not None and source_file.parent not in candidate_dirs:
+                        candidate_dirs.append(source_file.parent)
+                except Exception:
+                    pass
+
+        for source_dir in candidate_dirs:
+            source_file = source_dir / "mm_utils.py"
+            constants_file = source_dir / "constants.py"
+            try:
+                package_name = f"_videochat_external_pkg_{abs(hash(str(source_dir.resolve())))}"
+                package = sys.modules.get(package_name)
+                if package is None:
+                    package = types.ModuleType(package_name)
+                    package.__path__ = [str(source_dir)]
+                    sys.modules[package_name] = package
+
+                if constants_file.is_file():
+                    # Load constants.py as a module in the synthetic package namespace before loading mm_utils.
+                    # This is required because mm_utils.py contains relative imports like "from .constants import IMAGE_TOKEN_INDEX".
+                    # Without pre-loading constants into sys.modules, the relative import in mm_utils will fail.
+                    constants_module_name = f"{package_name}.constants"
+                    existing_constants = sys.modules.get(constants_module_name)
+                    existing_constants_file = (
+                        Path(getattr(existing_constants, "__file__", "")).resolve() if existing_constants else None
+                    )
+                    if existing_constants is None or existing_constants_file != constants_file.resolve():
+                        constants_spec = importlib.util.spec_from_file_location(constants_module_name, str(constants_file))
+                        if constants_spec is None or constants_spec.loader is None:
+                            raise ValueError(f"Unable to create module spec from {constants_file}")
+
+                        constants_module = importlib.util.module_from_spec(constants_spec)
+                        sys.modules[constants_module_name] = constants_module
+                        constants_spec.loader.exec_module(constants_module)
+
+                module_name = f"{package_name}.mm_utils"
+                module = _OVVideoChatFlashQwenForCausalLM._load_module_from_file(source_file, module_name)
+                module_func = getattr(module, "tokenizer_image_token", None)
+                if callable(module_func):
+                    _OVVideoChatFlashQwenForCausalLM._external_tokenizer_image_token = module_func
+                    return module_func
+            except Exception:
+                continue
+
+        raise ValueError("tokenizer_image_token is not loaded and automatic loading failed.")
+
+    @staticmethod
+    def _load_external_image_processor_class(model_name_or_path=None):
+        # Lazy-load InternVideo2ImageProcessor from vision_tower_builder.py.
+        # Prefer local model files first, then fall back to HuggingFace Hub, and cache the class.
+        processor_class = _OVVideoChatFlashQwenForCausalLM._external_image_processor_class
+        if processor_class is not None:
+            return processor_class
+
+        candidate_dirs = []
+
+        if model_name_or_path:
+            # Try as local path first
+            source_file = _OVVideoChatFlashQwenForCausalLM._resolve_source_file(
+                model_name_or_path, "vision_tower_builder.py", raise_on_error=False
+            )
+            if source_file is not None and source_file.parent not in candidate_dirs:
+                candidate_dirs.append(source_file.parent)
+
+            # If not a local path, try as repo_id from HuggingFace Hub
+            if not candidate_dirs and not str(model_name_or_path).startswith("/"):
+                try:
+                    source_file = hf_hub_download(repo_id=model_name_or_path, filename="vision_tower_builder.py")
+                    source_file = _OVVideoChatFlashQwenForCausalLM._resolve_source_file(
+                        Path(source_file).parent, "vision_tower_builder.py", raise_on_error=False
+                    )
+                    if source_file is not None and source_file.parent not in candidate_dirs:
+                        candidate_dirs.append(source_file.parent)
+                except Exception:
+                    pass
+
+        if not candidate_dirs:
+            raise ValueError("InternVideo2ImageProcessor is not loaded and automatic loading failed.")
+
+        for source_dir in candidate_dirs:
+            source_file = source_dir / "vision_tower_builder.py"
+            try:
+                module_name = f"_videochat_external_vtb_{abs(hash(str(source_file)))}"
+                module = _OVVideoChatFlashQwenForCausalLM._load_module_from_file(source_file, module_name)
+                processor_class = getattr(module, "InternVideo2ImageProcessor", None)
+                if processor_class is not None:
+                    _OVVideoChatFlashQwenForCausalLM._external_image_processor_class = processor_class
+                    return processor_class
+            except Exception:
+                continue
+
+        raise ValueError("InternVideo2ImageProcessor is not loaded and automatic loading failed.")
+
+    class _VisionProjectionModule(torch.nn.Module):
+        def __init__(self, owner):
+            super().__init__()
+            self._owner = owner
+
+        def forward(self, tensor):
+            return _OVVideoChatFlashQwenForCausalLM._to_torch(self._owner.vision_projection(tensor))
+
+    # Load image processor class and 3D sinusoidal position embedding helper from upstream file.
+    def _load_from_vision_tower_builder(self, model_save_dir) -> None:
+        source_file = self._resolve_source_file(model_save_dir, "vision_tower_builder.py")
+
+        try:
+            module_name = f"_videochat_external_vtb_{abs(hash(str(source_file)))}"
+            module = self._load_module_from_file(source_file, module_name)
+            module_func = getattr(module, "get_3d_sincos_pos_embed", None)
+            if not callable(module_func):
+                raise ValueError(f"{module.__name__} missing function: get_3d_sincos_pos_embed")
+
+            def _wrapped(_self, *args, _module_func=module_func, **kwargs):
+                return _OVVideoChatFlashQwenForCausalLM._to_torch(_module_func(*args, **kwargs))
+
+            self.get_3d_sincos_pos_embed = types.MethodType(_wrapped, self)
+
+            # Cache InternVideo2ImageProcessor from the same module while it is already loaded,
+            # so _load_external_image_processor_class can skip the file entirely.
+            if type(self)._external_image_processor_class is None:
+                processor_class = getattr(module, "InternVideo2ImageProcessor", None)
+                if processor_class is None:
+                    raise ValueError(f"{module.__name__} missing class: InternVideo2ImageProcessor")
+                type(self)._external_image_processor_class = processor_class
+
+        except Exception as exception:
+            raise ValueError(f"Failed to load from {source_file}: {exception}")
+
+    # Load and cache the upstream LlavaMetaForCausalLM base class used by the local adapter.
+    def _load_from_modeling_videochat_flash(self, model_save_dir) -> None:
+        if type(self)._external_videochat_base_class is not None:
+            return
+        source_file = self._resolve_source_file(model_save_dir, "modeling_videochat_flash.py")
+
+        package_name = f"_videochat_external_pkg_{abs(hash(str(source_file.parent)))}"
+        module_name = f"{package_name}.modeling_videochat_flash"
+
+        try:
+            package = sys.modules.get(package_name)
+            if package is None:
+                package = types.ModuleType(package_name)
+                package.__path__ = [str(source_file.parent)]
+                sys.modules[package_name] = package
+
+            module = self._load_module_from_file(source_file, module_name)
+
+            owner_class = getattr(module, "LlavaMetaForCausalLM", None)
+            if owner_class is None:
+                raise ValueError(f"{module.__name__} missing class: LlavaMetaForCausalLM")
+
+            if not callable(getattr(owner_class, "prepare_inputs_labels_for_multimodal", None)):
+                raise ValueError(f"{owner_class.__name__} missing method: prepare_inputs_labels_for_multimodal")
+            if not callable(getattr(owner_class, "encode_video_image", None)):
+                raise ValueError(f"{owner_class.__name__} missing method: encode_video_image")
+
+            type(self)._external_videochat_base_class = owner_class
+            return
+        except Exception as exception:
+            raise ValueError(f"Failed to load from {source_file}: {exception}")
+
+    # Load and cache the external projector class implementation (ToMe16_mlp_hd64).
+    def _load_external_projector_class(self, model_save_dir) -> None:
+        cached_class = type(self)._external_projector_class
+        if cached_class is not None:
+            return
+        source_file = self._resolve_source_file(model_save_dir, "mm_projector_builder.py")
+
+        try:
+            module_name = f"_videochat_external_mm_projector_builder_{abs(hash(str(source_file)))}"
+            module = self._load_module_from_file(source_file, module_name)
+
+            projector_class = getattr(module, "ToMe16_mlp_hd64", None)
+            if projector_class is None:
+                raise ValueError(f"{module.__name__} missing class: ToMe16_mlp_hd64")
+
+            type(self)._external_projector_class = projector_class
+            return
+        except Exception as exception:
+            raise ValueError(f"Failed to load external ToMe16_mlp_hd64 from {source_file}: {exception}")
+
+    def __init__(
+        self,
+        language_model: ov.Model,
+        text_embeddings: ov.Model,
+        vision_embeddings: ov.Model,
+        config: PretrainedConfig = None,
+        device: str = "CPU",
+        dynamic_shapes: bool = None,
+        ov_config: Optional[Dict[str, str]] = None,
+        model_save_dir: Optional[Union[str, Path, TemporaryDirectory]] = None,
+        quantization_config: Union[OVWeightQuantizationConfig, Dict] = None,
+        **kwargs,
+    ):
+        super().__init__(
+            language_model=language_model,
+            text_embeddings=text_embeddings,
+            vision_embeddings=vision_embeddings,
+            config=config,
+            device=device,
+            dynamic_shapes=dynamic_shapes,
+            ov_config=ov_config,
+            model_save_dir=model_save_dir,
+            quantization_config=quantization_config,
+            **kwargs,
+        )
+
+        self._load_from_vision_tower_builder(model_save_dir=model_save_dir)
+        self._load_external_tokenizer_image_token(model_name_or_path=model_save_dir)
+        self._load_from_modeling_videochat_flash(model_save_dir=model_save_dir)
+        self._load_external_projector_class(model_save_dir=model_save_dir)
+
+        num_frames = config.mm_local_num_frames
+        self.mm_num_attention_heads = config.mm_num_attention_heads
+        self.patch_size = config.patch_size
+        self.image_size = config.image_size
+        self.grid_size = (
+            num_frames,
+            self.image_size // self.patch_size,
+            self.image_size // self.patch_size,
+        )  # (T, H, W)
+        self.num_patches = self.grid_size[0] * self.grid_size[1] * self.grid_size[2]
+        self.num_img_patches = self.grid_size[1] * self.grid_size[2]
+        self.embed_dim = config.mm_hidden_size
+        self.pos_embed = torch.nn.Parameter(torch.zeros(1, self.num_patches + 1, self.embed_dim))
+        self.img_pos_embed = torch.nn.Parameter(torch.zeros(1, self.num_img_patches + 1, self.embed_dim))
+        # Adopted from https://huggingface.co/OpenGVLab/VideoChat-Flash-Qwen2_5-7B_InternVideo2-1B/blob/main/vision_tower_builder.py#L559
+        # pos_embed for video
+        pos_embed = self.get_3d_sincos_pos_embed(
+            self.pos_embed.shape[-1], self.grid_size[1], self.grid_size[0], cls_token=True
+        )
+        self.pos_embed.data.copy_(pos_embed.to(dtype=self.pos_embed.dtype).unsqueeze(0))
+        # pos_embed for image
+        img_pos_embed = self.get_3d_sincos_pos_embed(self.pos_embed.shape[-1], self.grid_size[1], 1, cls_token=True)
+        self.img_pos_embed.data.copy_(img_pos_embed.to(dtype=self.img_pos_embed.dtype).unsqueeze(0))
+
+        if "unpad" in getattr(config, "mm_patch_merge_type", ""):
+            self.image_newline = torch.nn.Parameter(torch.empty(config.hidden_size, dtype=self.dtype))
+        if (
+            "nopad" in getattr(config, "mm_patch_merge_type", "")
+            and getattr(self.config, "mm_newline_position", "nothing") != "nothing"
+        ):
+            self.frame_newline = torch.nn.Parameter(torch.empty(config.hidden_size, dtype=self.dtype))
+
+    def _build_external_projector(self):
+        # Instantiate ToMe16_mlp_hd64 and bind runtime attributes used during projection.
+        projector_class = type(self)._external_projector_class
+        if projector_class is None:
+            raise ValueError("ToMe16_mlp_hd64 is not loaded. Ensure __init__ completed successfully.")
+
+        projector = projector_class.__new__(projector_class)
+        torch.nn.Module.__init__(projector)
+        projector.hw = self.image_size // self.patch_size
+        projector.num_attention_heads = self.mm_num_attention_heads
+        projector.mlp = self._VisionProjectionModule(self)
+        return projector
+
+    def _get_external_projector(self):
+        projector = getattr(self, "_external_projector", None)
+        if projector is None:
+            projector = self._build_external_projector()
+            self._external_projector = projector
+        return projector
+
+    # Build a lightweight adapter object that matches LlavaMetaForCausalLM expectations.
+    def _build_videochat_adapter(self):
+        base_class = type(self)._external_videochat_base_class
+        if base_class is None:
+            raise ValueError("LlavaMetaForCausalLM is not loaded. Ensure __init__ completed successfully.")
+
+        owner = self
+
+        class _CallableNamespace(types.SimpleNamespace):
+            def __call__(self, *args, **kwargs):
+                return self._call(*args, **kwargs)
+
+        vision_tower = _CallableNamespace(image_size=owner.image_size, _call=owner.get_vision_embeddings)
+        model_adapter = types.SimpleNamespace(
+            mm_projector=_CallableNamespace(
+                num_image_patches_per_side=owner.image_size // owner.patch_size,
+                _call=lambda tensor, compress=False, local_num_frames=-1: owner.get_vision_projection(
+                    tensor,
+                    compress=compress,
+                    local_num_frames=local_num_frames,
+                ),
+            ),
+            embed_tokens=owner.get_text_embeddings,
+            get_vision_tower=lambda: vision_tower,
+        )
+
+        class _VideoChatFlashAdapter(base_class):
+            def __init__(self):
+                self.config = owner.config
+                self.device = owner.device
+                self.training = False
+                self.model = types.SimpleNamespace(
+                    image_newline=getattr(owner, "image_newline", None),
+                    frame_newline=getattr(owner, "frame_newline", None),
+                    llm_compress_type=None,
+                    llm_compress_layer_list=[],
+                    llm_image_token_ratio_list=[],
+                    first_image_token_position=[],
+                    text_prompt_lens=[],
+                    num_image_token_lens=[],
+                )
+                self._model = model_adapter
+
+            def get_model(self):
+                return self._model
+
+        return _VideoChatFlashAdapter()
+
+    def get_vision_embeddings(self, pixel_values, **kwargs):
+        # Adapted from https://huggingface.co/OpenGVLab/VideoChat-Flash-Qwen2_5-7B_InternVideo2-1B/blob/main/vision_tower_builder.py#L822-L832
+        # Upstream preprocessing provides BTCHW, but the vision tower expects BCHWT,
+        # so we permute dimensions before running the visual encoder.
+        # We then keep patch tokens in [B, T*L, C] (dropping cls later) because
+        # downstream token merging/projection operates on a flattened token sequence.
+        T = pixel_values.shape[1]
+        pixel_values = pixel_values.permute(0, 2, 1, 3, 4)
+        if T == 1:
+            pos_embeds = self.img_pos_embed.detach()
+        else:
+            pos_embeds = self.pos_embed.detach()
+        image_embeds = self.vision_embeddings(pixel_values, rotary_pos_emb=pos_embeds).last_hidden_state
+        image_embeds = image_embeds[:, 1:, :]
+        return self._to_torch(image_embeds)
+
+    def get_vision_projection(self, x, compress=False, local_num_frames=-1):
+        return self._get_external_projector()(x, compress=compress, local_num_frames=local_num_frames)
+
+    @staticmethod
+    def preprocess_inputs(
+        text: str,
+        image: Optional["Image"] = None,
+        processor: Optional[AutoImageProcessor] = None,
+        tokenizer: Optional[PreTrainedTokenizer] = None,
+        config: Optional[PretrainedConfig] = None,
+        video: Optional["VideoInput"] = None,
+        audio: Optional[np.ndarray] = None,
+    ):
+        if audio is not None:
+            raise ValueError("Audio input is not supported")
+        if tokenizer is None:
+            raise ValueError("Tokenizer is required.")
+        if config is None:
+            raise ValueError("Config is required.")
+        image_sizes = []
+        frames = []
+        modalities = []
+        results = {}
+        local_num_frames = config.mm_local_num_frames
+        if image is not None or video is not None:
+            _OVVideoChatFlashQwenForCausalLM._load_external_image_processor_class(
+                model_name_or_path=getattr(config, "_name_or_path", None)
+            )
+            # use default image_size from https://huggingface.co/OpenGVLab/VideoChat-Flash-Qwen2_5-7B_InternVideo2-1B/blob/main/vision_tower_builder.py#L682
+            target_image_size = getattr(config, "image_size", 224)
+            target_size = (target_image_size, target_image_size) if target_image_size is not None else None
+            # use default image_mean and image_std from https://huggingface.co/OpenGVLab/VideoChat-Flash-Qwen2_5-7B_InternVideo2-1B/blob/main/vision_tower_builder.py#L682
+            image_mean = getattr(config, "image_mean", (0.485, 0.456, 0.406))
+            image_std = getattr(config, "image_std", (0.229, 0.224, 0.225))
+            image_processor = _OVVideoChatFlashQwenForCausalLM._external_image_processor_class(
+                image_mean=image_mean, image_std=image_std, size=target_size
+            )
+
+        # preprocess text
+        prompt = f"<image>\n{text}" if (image is not None or video is not None) else text
+        if getattr(tokenizer, "chat_template", None) is not None:
+            messages = [{"role": "user", "content": prompt}]
+            text_prompt = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        else:
+            text_prompt = prompt
+        module_func = _OVVideoChatFlashQwenForCausalLM._load_external_tokenizer_image_token(
+            model_name_or_path=getattr(tokenizer, "name_or_path", None)
+        )
+        input_ids = module_func(
+            text_prompt,
+            tokenizer,
+            return_tensors="pt",
+        ).unsqueeze(0)
+        results["input_ids"] = input_ids
+
+        # preprocess video
+        if video is not None:
+            if isinstance(video, np.ndarray):
+                image_size = video.shape[1:3]
+                pad_frames = (-video.shape[0]) % local_num_frames
+                if pad_frames:
+                    video = np.concatenate([video, np.repeat(video[-1:], pad_frames, axis=0)], axis=0)
+            elif isinstance(video, list):
+                if isinstance(video[0], np.ndarray):
+                    image_size = video[0].shape[:2]
+                else:
+                    width, height = video[0].size
+                    image_size = (height, width)
+                pad_frames = (-len(video)) % local_num_frames
+                if pad_frames:
+                    video = video + [video[-1]] * pad_frames
+            else:
+                raise ValueError(f"Unsupported video type: {type(video)}")
+            image_sizes.append(image_size)
+            processed_images = image_processor.preprocess(images=video, return_tensors="pt", target_size=target_size)["pixel_values"]
+            frames.append(processed_images)
+            modalities.append("video")
+
+        # preprocess image
+        if image is not None:
+            from PIL.Image import Image as PILImage
+
+            if isinstance(image, PILImage):
+                width, height = image.size
+                image_size = (height, width)
+            else:
+                image_size = image.shape[:2]
+            image_frame = image_processor.preprocess(images=image, return_tensors="pt", target_size=target_size)["pixel_values"]
+            frames.append(image_frame)
+            image_sizes.append(image_size)
+            modalities.append("image")
+
+        if frames:
+            results["images"] = frames
+            results["image_sizes"] = image_sizes
+            results["modalities"] = modalities
+
+        if tokenizer.pad_token_id is None:
+            if "qwen" in tokenizer.name_or_path.lower():
+                logger.info("Setting pad token to bos token for qwen model.")
+                tokenizer.pad_token_id = tokenizer.bos_token_id
+        attention_masks = input_ids.ne(tokenizer.pad_token_id).long()
+        results["attention_mask"] = attention_masks
+
+        return results
+
+    def get_text_embeddings(self, input_ids, **kwargs):
+        squeeze_batch_dim = input_ids.ndim == 1
+        if squeeze_batch_dim:
+            input_ids = input_ids.unsqueeze(0)
+        text_embed = super().get_text_embeddings(input_ids, **kwargs)
+        if squeeze_batch_dim and text_embed.ndim > 0 and text_embed.shape[0] == 1:
+            text_embed = text_embed[0]
+        return self._to_torch(text_embed)
+
+    def get_multimodal_embeddings(
+        self,
+        input_ids,
+        pixel_values=None,
+        attention_mask=None,
+        position_ids=None,
+        modalities=None,
+        image_sizes=None,
+        **kwargs,
+    ):
+        images = pixel_values
+
+        if images is None:
+            inputs_embeds = self.get_text_embeddings(input_ids)
+            return inputs_embeds, attention_mask, position_ids
+
+        if isinstance(images, torch.Tensor) and images.ndim == 4:
+            images = [images]
+
+        adapter = self._build_videochat_adapter()
+        _, position_ids, attention_mask, _, inputs_embeds, _ = adapter.prepare_inputs_labels_for_multimodal(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            past_key_values=kwargs.get("past_key_values"),
+            labels=None,
+            images=images,
+            modalities=modalities,
+            image_sizes=image_sizes,
+        )
+
+        return inputs_embeds, attention_mask, position_ids
+
+    def _update_model_kwargs_for_generation(
+        self,
+        outputs: ModelOutput,
+        model_kwargs: Dict[str, Any],
+        is_encoder_decoder: bool = False,
+        num_new_tokens: int = 1,
+    ) -> Dict[str, Any]:
+        model_kwargs = super()._update_model_kwargs_for_generation(
+            outputs=outputs,
+            model_kwargs=model_kwargs,
+            is_encoder_decoder=is_encoder_decoder,
+            num_new_tokens=num_new_tokens,
+        )
+
+        # Vision inputs are only needed at the first step; later decoding uses cached states.
+        model_kwargs.pop("images", None)
+        model_kwargs.pop("image_sizes", None)
+        past_len = self.language_model._past_length
+        attn = model_kwargs.get("attention_mask")
+        # Keep mask length aligned with cached sequence length during incremental decoding.
+        if attn is not None and attn.shape[1] < past_len + 1:
+            model_kwargs["attention_mask"] = torch.ones(
+                (attn.shape[0], past_len + 1),
+                dtype=attn.dtype,
+                device=attn.device,
+            )
+
+        return model_kwargs
+
+    # Keep modalities compatibility only for VideoChat.
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+        past_key_values=None,
+        inputs_embeds=None,
+        pixel_values=None,
+        image_sizes=None,
+        modalities=None,
+        attention_mask=None,
+        **kwargs,
+    ):
+        model_inputs = super().prepare_inputs_for_generation(
+            input_ids=input_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            pixel_values=pixel_values,
+            image_sizes=image_sizes,
+            attention_mask=attention_mask,
+            **kwargs,
+        )
+        model_inputs["modalities"] = modalities
+        return model_inputs
+
+
 MODEL_TYPE_TO_CLS_MAPPING = {
     "llava": _OVLlavaForCausalLM,
     "llava_next": _OVLlavaNextForCausalLM,
@@ -4824,4 +5444,5 @@ MODEL_TYPE_TO_CLS_MAPPING = {
     "llama4": _OVLlama4ForCausalLM,
     "qwen3_vl": _OVQwen3VLForCausalLM,
     "minicpmo": _OVMiniCPMOForCausalLM,
+    "videochat_flash_qwen": _OVVideoChatFlashQwenForCausalLM,
 }

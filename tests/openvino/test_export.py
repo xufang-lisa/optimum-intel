@@ -116,6 +116,9 @@ class ExportModelTest(unittest.TestCase):
     if is_transformers_version(">=", "4.57.0") and is_transformers_version("<", "5"):
         SUPPORTED_ARCHITECTURES.update({"qwen3_next": OVModelForCausalLM})
 
+    if is_transformers_version(">=", "4.49") and is_transformers_version("<", "4.57.6"):
+        SUPPORTED_ARCHITECTURES.update({"videochat_flash_qwen": OVModelForVisualCausalLM})
+
     EXPECTED_DIFFUSERS_SCALE_FACTORS = {
         "stable-diffusion-xl": {"vae_encoder": "128.0", "vae_decoder": "128.0"},
         "stable-diffusion-3": {"text_encoder_3": "8.0"},
@@ -149,7 +152,7 @@ class ExportModelTest(unittest.TestCase):
             model_class = TasksManager.get_model_class_for_task(task, library=library_name)
             model = model_class(f"hf_hub:{model_name}", pretrained=True, exportable=True)
             TasksManager.standardize_model_attributes(model_name, model, library_name=library_name)
-        elif model_type == "llava":
+        elif model_type in ["llava", "videochat_flash_qwen"]:
             model = MODEL_TYPE_TO_CLS_MAPPING[model_type].auto_model_class.from_pretrained(
                 model_name, **loading_kwargs
             )
