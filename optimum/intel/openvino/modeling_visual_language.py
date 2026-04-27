@@ -12,7 +12,7 @@ from abc import abstractmethod
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import openvino
@@ -4815,8 +4815,6 @@ class _OVLlama4ForCausalLM(OVModelForVisualCausalLM):
 class _OVVideoChatFlashQwenForCausalLM(OVModelForVisualCausalLM):
     auto_model_class = AutoModel
     additional_parts = ["vision_projection"]
-    # Copied from https://huggingface.co/OpenGVLab/VideoChat-Flash-Qwen2_5-7B_InternVideo2-1B/blob/main/constants.py#L8
-    IMAGE_TOKEN_INDEX = -200
 
     @staticmethod
     def _resolve_videochat_source_dir(model_ref):
@@ -4955,8 +4953,6 @@ class _OVVideoChatFlashQwenForCausalLM(OVModelForVisualCausalLM):
 
         # Build a CPU-only execution context for prepare_inputs_labels_for_multimodal.
         # This avoids `x.to(self.device)` turning real tensors into meta tensors.
-        import types
-
         class _HFPrepareContext:
             pass
 
@@ -5036,16 +5032,13 @@ class _OVVideoChatFlashQwenForCausalLM(OVModelForVisualCausalLM):
             import vision_tower_builder
         finally:
             sys.path.pop(0)
-        vision_tower_builder = sys.modules.pop('vision_tower_builder')
+        vision_tower_builder = sys.modules.pop("vision_tower_builder")
         get_3d_sincos_pos_embed = vision_tower_builder.get_3d_sincos_pos_embed
 
-        num_frames = getattr(config, "mm_local_num_frames", 4)
-        self.mm_num_attention_heads = getattr(
-            config, "mm_num_attention_heads", getattr(config, "num_attention_heads", 1)
-        )
-        self.patch_size = getattr(config, "patch_size", 14)
-        self.image_size = getattr(config, "image_size", 224)
-        self.num_tome_tokens = getattr(config, "mm_projector_num_tome_tokens", 0)
+        num_frames = config.mm_local_num_frames
+        self.mm_num_attention_heads = config.mm_num_attention_heads
+        self.patch_size = config.patch_size
+        self.image_size = config.image_size
         self.grid_size = (
             num_frames,
             self.image_size // self.patch_size,
@@ -5134,11 +5127,9 @@ class _OVVideoChatFlashQwenForCausalLM(OVModelForVisualCausalLM):
         # use default image_mean and image_std from https://huggingface.co/OpenGVLab/VideoChat-Flash-Qwen2_5-7B_InternVideo2-1B/blob/main/vision_tower_builder.py#L682
         image_mean = getattr(config, "image_mean", (0.485, 0.456, 0.406))
         image_std = getattr(config, "image_std", (0.229, 0.224, 0.225))
-        
+
         # Create image processor once for reuse
-        image_processor = InternVideo2ImageProcessor(
-            size=target_size, image_mean=image_mean, image_std=image_std
-        )
+        image_processor = InternVideo2ImageProcessor(size=target_size, image_mean=image_mean, image_std=image_std)
 
         # preprocess text
         prompt = f"<image>\n{text}" if (image is not None or video is not None) else text
@@ -5151,9 +5142,7 @@ class _OVVideoChatFlashQwenForCausalLM(OVModelForVisualCausalLM):
             )
         else:
             text_prompt = prompt
-        input_ids = tokenizer_image_token(
-            text_prompt, tokenizer, _OVVideoChatFlashQwenForCausalLM.IMAGE_TOKEN_INDEX, return_tensors="pt"
-        ).unsqueeze(0)
+        input_ids = tokenizer_image_token(text_prompt, tokenizer, return_tensors="pt").unsqueeze(0)
         results["input_ids"] = input_ids
 
         # preprocess video
@@ -5205,7 +5194,11 @@ class _OVVideoChatFlashQwenForCausalLM(OVModelForVisualCausalLM):
         if tokenizer.pad_token_id is None and "qwen" in tokenizer.name_or_path.lower():
             logger.info("Using bos token as pad token for qwen model attention mask.")
             tokenizer.pad_token_id = tokenizer.bos_token_id
-        attention_masks = input_ids.ne(tokenizer.pad_token_id).long() if tokenizer.pad_token_id is not None else torch.ones_like(input_ids)
+        attention_masks = (
+            input_ids.ne(tokenizer.pad_token_id).long()
+            if tokenizer.pad_token_id is not None
+            else torch.ones_like(input_ids)
+        )
         results["attention_mask"] = attention_masks
 
         return results
