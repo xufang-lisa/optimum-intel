@@ -6,14 +6,13 @@ import inspect
 import logging
 import math
 import os
-import re
 import sys
 import types
 import warnings
 from abc import abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import openvino
@@ -4815,8 +4814,6 @@ class _OVVideoChatFlashQwenForCausalLM(OVModelForVisualCausalLM):
     _external_projector_class = None
     _external_videochat_base_class = None
     _external_tokenizer_image_token = None
-    # Copied from https://huggingface.co/OpenGVLab/VideoChat-Flash-Qwen2_5-7B_InternVideo2-1B/blob/main/constants.py#L8
-    IMAGE_TOKEN_INDEX = -200
 
     @staticmethod
     def _to_torch(value):
@@ -4829,13 +4826,27 @@ class _OVVideoChatFlashQwenForCausalLM(OVModelForVisualCausalLM):
         return value
 
     @staticmethod
-    def _resolve_source_file(model_save_dir, source_filename: str) -> Path:
-        if model_save_dir is None:
-            raise ValueError(f"model_save_dir is required to load {source_filename}")
-        model_dir_path = model_save_dir.name if isinstance(model_save_dir, TemporaryDirectory) else model_save_dir
-        source_file = Path(model_dir_path).resolve() / source_filename
+    def _resolve_source_file(model_save_dir, source_filename: str, raise_on_error: bool = True) -> Optional[Path]:
+        normalized_value = model_save_dir.name if isinstance(model_save_dir, TemporaryDirectory) else model_save_dir
+        if not normalized_value:
+            if raise_on_error:
+                raise ValueError(f"model_save_dir is required to load {source_filename}")
+            return None
+        try:
+            model_dir_path = Path(normalized_value).resolve()
+        except Exception:
+            if raise_on_error:
+                raise ValueError(f"Invalid model_save_dir: {normalized_value}")
+            return None
+
+        if model_dir_path.is_file():
+            model_dir_path = model_dir_path.parent
+
+        source_file = model_dir_path / source_filename
         if not source_file.is_file():
-            raise ValueError(f"Source file was not found: {source_file}")
+            if raise_on_error:
+                raise ValueError(f"Source file was not found: {source_file}")
+            return None
         return source_file
 
     @staticmethod
@@ -4852,7 +4863,7 @@ class _OVVideoChatFlashQwenForCausalLM(OVModelForVisualCausalLM):
         return module
 
     @staticmethod
-    def _ensure_external_tokenizer_image_token_loaded(model_name_or_path=None):
+    def _load_external_tokenizer_image_token(model_name_or_path=None):
         # Lazy-load tokenizer_image_token from mm_utils.py.
         # Searches model_name_or_path as a local path, then falls back to HuggingFace Hub.
         # Caches the callable on the class.
@@ -4862,21 +4873,13 @@ class _OVVideoChatFlashQwenForCausalLM(OVModelForVisualCausalLM):
 
         candidate_dirs = []
 
-        def _add_candidate(value):
-            if not value:
-                return
-            try:
-                path = Path(value).resolve()
-            except Exception:
-                return
-            if path.is_file():
-                path = path.parent
-            if path.is_dir() and (path / "mm_utils.py").is_file():
-                candidate_dirs.append(path)
-
         if model_name_or_path:
             # Try as local path first
-            _add_candidate(model_name_or_path)
+            source_file = _OVVideoChatFlashQwenForCausalLM._resolve_source_file(
+                model_name_or_path, "mm_utils.py", raise_on_error=False
+            )
+            if source_file is not None and source_file.parent not in candidate_dirs:
+                candidate_dirs.append(source_file.parent)
 
             # If not a local path, try as repo_id from HuggingFace Hub
             if not candidate_dirs and not str(model_name_or_path).startswith("/"):
@@ -4884,7 +4887,11 @@ class _OVVideoChatFlashQwenForCausalLM(OVModelForVisualCausalLM):
                     mm_utils_file = hf_hub_download(repo_id=model_name_or_path, filename="mm_utils.py")
                     # Download constants.py along with mm_utils to satisfy mm_utils.py's relative import: from .constants import IMAGE_TOKEN_INDEX
                     hf_hub_download(repo_id=model_name_or_path, filename="constants.py")
-                    _add_candidate(Path(mm_utils_file).parent)
+                    source_file = _OVVideoChatFlashQwenForCausalLM._resolve_source_file(
+                        Path(mm_utils_file).parent, "mm_utils.py", raise_on_error=False
+                    )
+                    if source_file is not None and source_file.parent not in candidate_dirs:
+                        candidate_dirs.append(source_file.parent)
                 except Exception:
                     pass
 
@@ -4929,7 +4936,7 @@ class _OVVideoChatFlashQwenForCausalLM(OVModelForVisualCausalLM):
         raise ValueError("tokenizer_image_token is not loaded and automatic loading failed.")
 
     @staticmethod
-    def _ensure_external_image_processor_class_loaded(model_name_or_path=None):
+    def _load_external_image_processor_class(model_name_or_path=None):
         # Lazy-load InternVideo2ImageProcessor from vision_tower_builder.py.
         # Prefer local model files first, then fall back to HuggingFace Hub, and cache the class.
         processor_class = _OVVideoChatFlashQwenForCausalLM._external_image_processor_class
@@ -4938,27 +4945,23 @@ class _OVVideoChatFlashQwenForCausalLM(OVModelForVisualCausalLM):
 
         candidate_dirs = []
 
-        def _add_candidate(value):
-            if not value:
-                return
-            try:
-                path = Path(value).resolve()
-            except Exception:
-                return
-            if path.is_file():
-                path = path.parent
-            if path.is_dir() and (path / "vision_tower_builder.py").is_file():
-                candidate_dirs.append(path)
-
         if model_name_or_path:
             # Try as local path first
-            _add_candidate(model_name_or_path)
+            source_file = _OVVideoChatFlashQwenForCausalLM._resolve_source_file(
+                model_name_or_path, "vision_tower_builder.py", raise_on_error=False
+            )
+            if source_file is not None and source_file.parent not in candidate_dirs:
+                candidate_dirs.append(source_file.parent)
 
             # If not a local path, try as repo_id from HuggingFace Hub
             if not candidate_dirs and not str(model_name_or_path).startswith("/"):
                 try:
                     source_file = hf_hub_download(repo_id=model_name_or_path, filename="vision_tower_builder.py")
-                    candidate_dirs.append(Path(source_file).parent)
+                    source_file = _OVVideoChatFlashQwenForCausalLM._resolve_source_file(
+                        Path(source_file).parent, "vision_tower_builder.py", raise_on_error=False
+                    )
+                    if source_file is not None and source_file.parent not in candidate_dirs:
+                        candidate_dirs.append(source_file.parent)
                 except Exception:
                     pass
 
@@ -5004,7 +5007,7 @@ class _OVVideoChatFlashQwenForCausalLM(OVModelForVisualCausalLM):
             self.get_3d_sincos_pos_embed = types.MethodType(_wrapped, self)
 
             # Cache InternVideo2ImageProcessor from the same module while it is already loaded,
-            # so _ensure_external_image_processor_class_loaded can skip the file entirely.
+            # so _load_external_image_processor_class can skip the file entirely.
             if type(self)._external_image_processor_class is None:
                 processor_class = getattr(module, "InternVideo2ImageProcessor", None)
                 if processor_class is None:
@@ -5013,11 +5016,6 @@ class _OVVideoChatFlashQwenForCausalLM(OVModelForVisualCausalLM):
 
         except Exception as exception:
             raise ValueError(f"Failed to load from {source_file}: {exception}")
-
-    # Load tokenizer_image_token helper from upstream file.
-    def _load_from_mm_utils(self, model_save_dir) -> None:
-        model_dir = model_save_dir.name if isinstance(model_save_dir, TemporaryDirectory) else model_save_dir
-        self._ensure_external_tokenizer_image_token_loaded(model_name_or_path=model_dir)
 
     # Load and cache the upstream LlavaMetaForCausalLM base class used by the local adapter.
     def _load_from_modeling_videochat_flash(self, model_save_dir) -> None:
@@ -5098,7 +5096,7 @@ class _OVVideoChatFlashQwenForCausalLM(OVModelForVisualCausalLM):
         )
 
         self._load_from_vision_tower_builder(model_save_dir=model_save_dir)
-        self._load_from_mm_utils(model_save_dir=model_save_dir)
+        self._load_external_tokenizer_image_token(model_name_or_path=model_save_dir)
         self._load_from_modeling_videochat_flash(model_save_dir=model_save_dir)
         self._load_external_projector_class(model_save_dir=model_save_dir)
 
@@ -5222,19 +5220,6 @@ class _OVVideoChatFlashQwenForCausalLM(OVModelForVisualCausalLM):
         return self._get_external_projector()(x, compress=compress, local_num_frames=local_num_frames)
 
     @staticmethod
-    def image_preprocess(images, target_size, image_mean, image_std):
-        processor_class = _OVVideoChatFlashQwenForCausalLM._external_image_processor_class
-        if processor_class is None:
-            raise ValueError("InternVideo2ImageProcessor is not loaded. Ensure __init__ completed successfully.")
-
-        processor = processor_class(image_mean=image_mean, image_std=image_std, size=target_size)
-        batch = processor.preprocess(images=images, return_tensors="pt", target_size=target_size)
-        pixel_values = batch["pixel_values"] if isinstance(batch, dict) else getattr(batch, "pixel_values", None)
-        if pixel_values is None:
-            raise ValueError("External InternVideo2ImageProcessor.preprocess did not return pixel_values.")
-        return _OVVideoChatFlashQwenForCausalLM._to_torch(pixel_values)
-
-    @staticmethod
     def preprocess_inputs(
         text: str,
         image: Optional["Image"] = None,
@@ -5256,7 +5241,7 @@ class _OVVideoChatFlashQwenForCausalLM(OVModelForVisualCausalLM):
         results = {}
         local_num_frames = config.mm_local_num_frames
         if image is not None or video is not None:
-            _OVVideoChatFlashQwenForCausalLM._ensure_external_image_processor_class_loaded(
+            _OVVideoChatFlashQwenForCausalLM._load_external_image_processor_class(
                 model_name_or_path=getattr(config, "_name_or_path", None)
             )
             # use default image_size from https://huggingface.co/OpenGVLab/VideoChat-Flash-Qwen2_5-7B_InternVideo2-1B/blob/main/vision_tower_builder.py#L682
@@ -5265,6 +5250,9 @@ class _OVVideoChatFlashQwenForCausalLM(OVModelForVisualCausalLM):
             # use default image_mean and image_std from https://huggingface.co/OpenGVLab/VideoChat-Flash-Qwen2_5-7B_InternVideo2-1B/blob/main/vision_tower_builder.py#L682
             image_mean = getattr(config, "image_mean", (0.485, 0.456, 0.406))
             image_std = getattr(config, "image_std", (0.229, 0.224, 0.225))
+            image_processor = _OVVideoChatFlashQwenForCausalLM._external_image_processor_class(
+                image_mean=image_mean, image_std=image_std, size=target_size
+            )
 
         # preprocess text
         prompt = f"<image>\n{text}" if (image is not None or video is not None) else text
@@ -5277,13 +5265,12 @@ class _OVVideoChatFlashQwenForCausalLM(OVModelForVisualCausalLM):
             )
         else:
             text_prompt = prompt
-        module_func = _OVVideoChatFlashQwenForCausalLM._ensure_external_tokenizer_image_token_loaded(
+        module_func = _OVVideoChatFlashQwenForCausalLM._load_external_tokenizer_image_token(
             model_name_or_path=getattr(tokenizer, "name_or_path", None)
         )
         input_ids = module_func(
             text_prompt,
             tokenizer,
-            image_token_index=_OVVideoChatFlashQwenForCausalLM.IMAGE_TOKEN_INDEX,
             return_tensors="pt",
         ).unsqueeze(0)
         results["input_ids"] = input_ids
@@ -5307,9 +5294,7 @@ class _OVVideoChatFlashQwenForCausalLM(OVModelForVisualCausalLM):
             else:
                 raise ValueError(f"Unsupported video type: {type(video)}")
             image_sizes.append(image_size)
-            processed_images = _OVVideoChatFlashQwenForCausalLM.image_preprocess(
-                images=video, target_size=target_size, image_mean=image_mean, image_std=image_std
-            )
+            processed_images = image_processor.preprocess(images=video, return_tensors="pt", target_size=target_size)["pixel_values"]
             frames.append(processed_images)
             modalities.append("video")
 
@@ -5322,9 +5307,7 @@ class _OVVideoChatFlashQwenForCausalLM(OVModelForVisualCausalLM):
                 image_size = (height, width)
             else:
                 image_size = image.shape[:2]
-            image_frame = _OVVideoChatFlashQwenForCausalLM.image_preprocess(
-                images=image, target_size=target_size, image_mean=image_mean, image_std=image_std
-            )
+            image_frame = image_processor.preprocess(images=image, return_tensors="pt", target_size=target_size)["pixel_values"]
             frames.append(image_frame)
             image_sizes.append(image_size)
             modalities.append("image")
@@ -5370,12 +5353,6 @@ class _OVVideoChatFlashQwenForCausalLM(OVModelForVisualCausalLM):
 
         if isinstance(images, torch.Tensor) and images.ndim == 4:
             images = [images]
-
-        if modalities is None:
-            if isinstance(images, list):
-                modalities = ["video" if image.shape[0] > 1 else "image" for image in images]
-            else:
-                modalities = ["image"]
 
         adapter = self._build_videochat_adapter()
         _, position_ids, attention_mask, _, inputs_embeds, _ = adapter.prepare_inputs_labels_for_multimodal(
